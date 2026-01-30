@@ -1,0 +1,28 @@
+# Streaming Backend — Python dependencies
+# Install: pip install -r requirements.txt
+#
+# System requirement (not pip-installable):
+#   FFmpeg — required for merging video chunks.
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  sudo apt install ffmpeg
+#   Windows: https://ffmpeg.org/download.html
+
+# --- Core (required) ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.17
+python-dotenv==1.0.1
+
+# --- Background tasks (optional; merge runs in-process if not installed) ---
+celery[redis]==5.4.0
+redis==5.2.1
+
+# --- DB (optional; for persisting proctoring events) ---
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+
+# --- Cloud storage (optional; uncomment if using) ---
+# boto3==1.35.93
+# google-cloud-storage==2.18.4

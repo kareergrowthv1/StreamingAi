@@ -54,7 +54,7 @@ def do_merge_chunks(client_id: str, position_id: str, candidate_id: str) -> dict
             cmd_reencode = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", str(list_file),
-                "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart",
+                "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", "-movflags", "+faststart",
                 str(out_file),
             ]
             result2 = subprocess.run(

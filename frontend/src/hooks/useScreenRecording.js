@@ -16,6 +16,8 @@ export function useScreenRecording(clientId, positionId, candidateId) {
   const [mergeSuccess, setMergeSuccess] = useState(false)
   const mediaRecorderRef = useRef(null)
   const streamRef = useRef(null)
+  const audioContextRef = useRef(null)
+  const micStreamRef = useRef(null)
   const chunkIndexRef = useRef(0)
   const chunkTimerRef = useRef(null)
   const stillRecordingRef = useRef(false)
@@ -48,18 +50,59 @@ export function useScreenRecording(clientId, positionId, candidateId) {
     setChunkIndex(0)
     stillRecordingRef.current = true
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
+      // 1. Get Screen Stream (System Audio)
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { displaySurface: 'browser' },
-        audio: false,
+        audio: true, // Request system audio
       })
-      streamRef.current = stream
+
+      // 2. Get Microphone Stream
+      let micStream
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false,
+        })
+      } catch (err) {
+        console.warn('Mic access denied or unavailable', err)
+      }
+
+      // 3. Setup Audio Mixing
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)()
+      const dest = audioContext.createMediaStreamDestination()
+
+      // Mix Screen Audio
+      if (screenStream.getAudioTracks().length > 0) {
+        const screenSource = audioContext.createMediaStreamSource(screenStream)
+        screenSource.connect(dest)
+      }
+
+      // Mix Mic Audio
+      if (micStream && micStream.getAudioTracks().length > 0) {
+        micStreamRef.current = micStream
+        const micSource = audioContext.createMediaStreamSource(micStream)
+        micSource.connect(dest)
+      }
+
+      audioContextRef.current = audioContext
+
+      // 4. Combine Video + Mixed Audio
+      const mixedAudioTracks = dest.stream.getAudioTracks()
+      const combinedStream = new MediaStream([
+        ...screenStream.getVideoTracks(),
+        ...mixedAudioTracks
+      ])
+
+      streamRef.current = screenStream // Keep ref to screen stream for stopping
+
       const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
         ? 'video/webm;codecs=vp9'
         : 'video/webm'
 
       const startNextChunk = () => {
         if (!stillRecordingRef.current || !streamRef.current) return
-        const recorder = new MediaRecorder(streamRef.current, {
+        // Use combinedStream for recording
+        const recorder = new MediaRecorder(combinedStream, {
           mimeType: mime,
           videoBitsPerSecond: 2_500_000,
         })
@@ -99,15 +142,33 @@ export function useScreenRecording(clientId, positionId, candidateId) {
       chunkTimerRef.current = null
     }
     const recorder = mediaRecorderRef.current
-    const stream = streamRef.current
+    const screenStream = streamRef.current
+    const micStream = micStreamRef.current
+    const audioContext = audioContextRef.current
+
     if (recorder && recorder.state !== 'inactive') {
       recorder.stop()
       mediaRecorderRef.current = null
     }
-    if (stream) {
-      stream.getTracks().forEach((t) => t.stop())
+
+    // Stop Screen Stream
+    if (screenStream) {
+      screenStream.getTracks().forEach((t) => t.stop())
       streamRef.current = null
     }
+
+    // Stop Mic Stream
+    if (micStream) {
+      micStream.getTracks().forEach((t) => t.stop())
+      micStreamRef.current = null
+    }
+
+    // Close Audio Context
+    if (audioContext) {
+      audioContext.close()
+      audioContextRef.current = null
+    }
+
     setIsRecording(false)
     setError(null)
     try {

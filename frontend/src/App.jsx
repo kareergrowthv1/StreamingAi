@@ -13,6 +13,8 @@ export default function App() {
   const [clientId, setClientId] = useState('')
   const [positionId, setPositionId] = useState('')
   const [candidateId, setCandidateId] = useState('')
+  // New state for video player
+  const [showVideo, setShowVideo] = useState(false)
 
   const { captureAndUpload, status: screenshotStatus, error: screenshotError } = useScreenshot(
     clientId,
@@ -37,7 +39,7 @@ export default function App() {
   const handleCapture = async () => {
     try {
       await captureAndUpload()
-    } catch (_) {}
+    } catch (_) { }
   }
 
   return (
@@ -97,6 +99,19 @@ export default function App() {
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem' }}>
         <button
+          onClick={() => setShowVideo(!showVideo)}
+          style={{
+            padding: '0.5rem 1rem',
+            borderRadius: 8,
+            border: '1px solid #475569',
+            background: showVideo ? '#eab308' : '#334155', // Yellow if active
+            color: showVideo ? '#000' : '#e2e8f0',
+            cursor: 'pointer',
+          }}
+        >
+          {showVideo ? 'Hide Test Video' : 'Test Audio (Play Video)'}
+        </button>
+        <button
           onClick={handleCapture}
           disabled={screenshotStatus === 'capturing' || screenshotStatus === 'uploading'}
           style={{
@@ -143,6 +158,24 @@ export default function App() {
           End Test
         </button>
       </div>
+
+      {/* Video Player Section */}
+      {showVideo && (
+        <div style={{ marginBottom: '1.5rem', border: '1px solid #475569', borderRadius: 8, overflow: 'hidden' }}>
+          <div style={{ padding: '0.5rem', background: '#334155', fontSize: '0.875rem' }}>
+            System Audio Test: Play this video and ensure "Share System Audio" is checked when starting stream.
+          </div>
+          <iframe
+            width="100%"
+            height="315"
+            src="https://www.youtube.com/embed/jfKfPfyJRdk?autoplay=1"
+            title="YouTube video player"
+            frameBorder="0"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+          ></iframe>
+        </div>
+      )}
 
       {(screenshotError || recordingError) && (
         <p style={{ color: '#f87171', fontSize: '0.875rem', marginBottom: '0.5rem' }}>

@@ -266,3 +266,4 @@ Streaming/
 | **"No module named 'celery'"** | Backend works without Celery; merge runs in-process. To use Celery: `pip install celery[redis]` and run Redis + worker. |
 | **CORS errors** | Ensure `CORS_ORIGINS` in backend `.env` includes your frontend origin (e.g. `http://localhost:5174`). |
 | **Merge fails / video not playable** | Ensure FFmpeg is installed and chunks are being uploaded (check `CHUNKS_DIR`). Backend tries copy then re-encode; check server logs for FFmpeg errors. |
+# StreamingAi

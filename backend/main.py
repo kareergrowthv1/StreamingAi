@@ -13,12 +13,12 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 import websockets
 import edge_tts
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Body, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -30,6 +30,7 @@ from cross_question import generate_cross_question
 from screening_utils import (
     build_flat_qa_list,
     build_screening_categories_from_sections,
+    parse_seconds,
     flat_index_to_conv_and_pair,
     followup_count_for_conv_key,
     get_next_unanswered_from_screening,
@@ -39,6 +40,7 @@ from screening_utils import (
 from api_admin import (
     get_assessment_summaries as admin_get_assessment_summaries,
     get_question_sections as admin_get_question_sections,
+    get_cross_question_settings as admin_get_cross_question_settings,
     put_round_timing as admin_put_round_timing,
     put_update_interview_status as admin_put_update_interview_status,
     patch_complete_interview as admin_patch_complete_interview,
@@ -49,6 +51,9 @@ from api_candidate import (
     put_candidate_interview as candidate_put_interview,
     get_question_answers as candidate_get_question_answers,
     post_question_answer as candidate_post_question_answer,
+    get_interview_responses as ir_get,
+    post_interview_responses as ir_post,
+    patch_interview_responses as ir_patch,
 )
 # No DB in Streaming AI — Q&A save/fetch via CandidateBackend; proctoring/session storage is in other services.
 # AI routes: resume ATS, skills, JD – all use dynamic config (Superadmin GET /superadmin/settings/ai-config)
@@ -60,7 +65,12 @@ from coding_question import router as coding_question_router
 from interview_question_generator import router as interview_question_router
 from admin_report_api import router as admin_report_router
 from daily_quiz import router as daily_quiz_router
+from Conversationalmessage import router as conversational_message_router
+from ResumeReport import router as resume_report_router
+from AIResumecontent import router as resume_ai_content_router
+from EmailTemplate import router as email_template_router
 from stt_streaming import AssemblyAIStreamRunner
+from fakeoffer import router as fake_offer_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,6 +130,12 @@ app.include_router(coding_question_router)
 app.include_router(interview_question_router)
 app.include_router(admin_report_router)
 app.include_router(daily_quiz_router)
+app.include_router(conversational_message_router)
+app.include_router(resume_report_router)
+app.include_router(resume_ai_content_router)
+app.include_router(fake_offer_router)
+from verify_admin_token import verify_admin_token
+# app.include_router(email_template_router, prefix="/ai") # Moved to main.py directly for reliability
 
 # Report generator (FIFO queue, all 4 rounds, MongoDB + MySQL updates)
 from report_generator import router as report_router, _start_worker as _start_report_worker, _ensure_report_index
@@ -127,6 +143,13 @@ app.include_router(report_router)
 
 
 # --- Pydantic models ---
+class EmailTemplateAIRequest(BaseModel):
+    mode: str = Field(..., description="'generate' or 'refine'")
+    prompt: str = Field(..., description="User's prompt or instruction")
+    currentBody: Optional[str] = Field(None, description="Current email body (for refinement)")
+    variables: Optional[List[str]] = Field(None, description="List of available dynamic variables")
+
+
 class ProctoringEvent(BaseModel):
     event: str = Field(..., description="no_face | multiple_faces | head_turned | looking_left | looking_right | looking_up | looking_down")
     confidence: float = Field(..., ge=0, le=1)
@@ -180,6 +203,75 @@ class SubmitAnswerAndGetNextRequest(BaseModel):
     crossQuestionCountPosition: Optional[int] = None
 
 
+@app.post("/ai/generate-email-template")
+@app.post("/api/ai/generate-email-template")
+async def generate_email_template(request: EmailTemplateAIRequest = Body(...), _: bool = Depends(verify_admin_token)):
+    """Generate or refine an email template body using AI."""
+    from ai_config_loader import get_ai_config
+    
+    available_vars = ", ".join(request.variables) if request.variables is not None else "{candidate_name}, {Position_title}, {company_name}"
+    
+    system_prompt = f"""
+You are a professional HR and Recruitment Assistant. Your goal is to write high-quality, professional emails.
+You MUST use dynamic variables in curly braces like {{candidate_name}}.
+
+Available variables you can use:
+{available_vars}
+
+IMPORTANT: If `{company_name}` is empty, not provided, or marked as optional, you MUST use the `{Position_title}` as the primary identifier in the email context (e.g., "You have been selected for the {{Position_title}} role" instead of "You have been selected for a role at {{company_name}}").
+
+If the user provides a prompt, generate a complete email Subject and Body.
+If the user provides a 'currentBody', refine and improve both the subject and the body while keeping the core message and variables intact.
+
+Response format: Return a JSON object with two keys:
+1. "subject": A professional subject line (can include variables, prefer Position_title over company_name if ambiguous).
+2. "body": The complete email body.
+"""
+
+    if request.mode == "refine" and request.currentBody:
+        user_prompt = f"Refine the following email based on this instruction: {request.prompt}\n\nCurrent Body:\n{request.currentBody}"
+    else:
+        user_prompt = f"Generate a professional email subject and body for: {request.prompt}"
+
+    def _get_openai_client(cfg: dict):
+        api_key = cfg.get("apiKey") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("API key required. Set in Superadmin Settings > AI Config or OPENAI_API_KEY.")
+        import openai
+        return openai.OpenAI(
+            api_key=api_key,
+            base_url=cfg.get("baseUrl", "https://api.openai.com/v1"),
+            timeout=cfg.get("timeout", 300),
+            max_retries=cfg.get("maxRetries", 3),
+        )
+
+    try:
+        cfg = await get_ai_config()
+        client = _get_openai_client(cfg)
+        model = cfg.get("model", "gpt-4o")
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.7,
+            max_tokens=1000,
+        )
+        
+        data = json.loads(response.choices[0].message.content or "{}")
+        return {
+            "success": True, 
+            "subject": data.get("subject", ""),
+            "body": data.get("body", "")
+        }
+    except Exception as e:
+        logger.exception("Email template AI generation failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/submit-answer-and-get-next")
 @app.post("/api/submit-answer-and-get-next")
 async def submit_answer_and_get_next(request: SubmitAnswerAndGetNextRequest):
@@ -187,7 +279,7 @@ async def submit_answer_and_get_next(request: SubmitAnswerAndGetNextRequest):
     Save the candidate's answer for round 1 or 2 and return the next question (next main question or generated cross-question).
     Frontend uses this to advance after each answer without relying on WebSocket next_question.
     """
-    logger.info(f"[API IN] POST /api/submit-answer-and-get-next | Round {request.round} | Q#{request.questionId} | isConversational={request.isConversational} | crossGeneral={request.crossQuestionCountGeneral} | crossPosition={request.crossQuestionCountPosition}")
+    logger.info(f"[API IN] POST /api/submit-answer-and-get-next | Round {request.round} | Q#{request.questionId} | isConversational={request.isConversational}")
     
     if request.round not in (1, 2):
         raise HTTPException(status_code=400, detail="round must be 1 or 2")
@@ -222,7 +314,7 @@ async def submit_answer_and_get_next(request: SubmitAnswerAndGetNextRequest):
             "candidateId": cid, "positionId": pid, "questionSetId": qset_id,
             "clientId": request.clientId or "", "categories": categories_new,
             "isScreeningCompleted": False, "type": "CONVERSATIONAL",
-        })
+        }, tenant_id=tenant_id)
         if 200 <= pr_status < 300 and post_body:
             screening_id = post_body.get("id")
             doc = post_body
@@ -269,10 +361,23 @@ async def submit_answer_and_get_next(request: SubmitAnswerAndGetNextRequest):
     next_q_text = ""
     all_done = next_idx >= len(flat)
 
-    # 4) Optional: generate cross-question (if conversational and under per-main-question limit)
+    # 4) Fetch authoritative cross-question settings from AdminBackend DB (for HTTP stateless calls)
+    # Do NOT use frontend-sent values; always fetch what admin configured.
+    cross_count_general = 2  # defaults
+    cross_count_position = 2
+    if admin_url and request.clientId:
+        try:
+            cq_settings = await admin_get_cross_question_settings(admin_url, request.clientId, tenant_id)
+            cross_count_general = cq_settings["crossQuestionCountGeneral"]
+            cross_count_position = cq_settings["crossQuestionCountPosition"]
+            logger.info(f"[API] Cross-question settings from DB: general={cross_count_general} position={cross_count_position}")
+        except Exception as _cq_e:
+            logger.warning(f"[API] Cross-question settings fetch failed (using defaults): {_cq_e}")
+
+    # 5) Optional: generate cross-question (if conversational and under per-main-question limit)
     # NOTE: Do NOT gate on `not all_done` — last main question also deserves cross-questions.
     conv_key_for_cross = conv_key
-    default_cross = request.crossQuestionCountGeneral if round_num == 1 else request.crossQuestionCountPosition
+    default_cross = cross_count_general if round_num == 1 else cross_count_position
     cross_count = min(4, max(1, int(default_cross or 2)))
     if is_conversational and conv_key_for_cross and screening_id:
         followups = followup_count_for_conv_key(doc, round_num, conv_key_for_cross)
@@ -603,12 +708,8 @@ async def websocket_video_stream(
                 f.flush()
                 chunk_count += 1
                 total_bytes += len(data)
-                if chunk_count == 1:
-                    print(f"[SCREEN RECORDING] First chunk received ({len(data)} bytes), saving to {part_name}\n", flush=True)
-                    logger.info("[SCREEN RECORDING] First chunk received, file=%s", part_name)
-                elif chunk_count % 50 == 0:
-                    print(f"[SCREEN RECORDING] Saving... chunks={chunk_count} total_bytes={total_bytes} file={part_name}\n", flush=True)
-                    logger.info("[SCREEN RECORDING] Progress: %d chunks, %d bytes", chunk_count, total_bytes)
+                if chunk_count % 20 == 0:  # Log every 20 chunks to keep it clean
+                    print(f"[WS CHUNK] video candidate_id={candidate_id} part={part_name} received={total_bytes} bytes", flush=True)
     except WebSocketDisconnect:
         _close_banner = (
             "\n" + "=" * 64 + "\n"
@@ -655,6 +756,9 @@ async def websocket_camera_stream(
             while True:
                 data = await websocket.receive_bytes()
                 f.write(data)
+                f.flush()
+                # Log camera chunk concise
+                print(f"[WS CHUNK] camera candidate_id={candidate_id} part={part_name} len={len(data)}", flush=True)
     except WebSocketDisconnect:
         _cam_end = (
             "\n" + "=" * 64 + "\n"
@@ -668,62 +772,45 @@ async def websocket_camera_stream(
         logger.exception("Camera WS error: %s", e)
 
 
-# --- REST: End test — trigger merge (Celery if available, else sync) ---
+# --- REST: End test — trigger merge (Background Task) ---
 @app.post("/api/end-test")
 async def end_test(
+    background_tasks: BackgroundTasks,
     client_id: str = Form(...),
     position_id: str = Form(...),
     candidate_id: str = Form(...),
 ):
-    """End test: merge chunks with FFmpeg. Uses Celery if enabled, else runs merge in-process."""
-    if config.CELERY_ENABLED:
-        try:
-            from tasks import merge_video_chunks
-            merge_video_chunks.delay(client_id, position_id, candidate_id)
-            return {"success": True, "message": "Merge job queued"}
-        except Exception as e:
-            logger.warning("Celery enabled but failed to queue (%s), running merge in-process", e)
-
-    # Fallback or Default: Sync merge (screen recording)
-    print(f"\n[SCREEN RECORDING] Merge started for {client_id}/{candidate_id}\n", flush=True)
-    logger.info("[SCREEN RECORDING] Merge started: client_id=%s candidate_id=%s", client_id, candidate_id)
-    try:
-        result = await asyncio.to_thread(do_merge_chunks, client_id, position_id, candidate_id)
-        # Session/proctoring metadata is stored by CandidateBackend or other services; no DB here.
-        if result.get("success"):
-            print(f"[SCREEN RECORDING] Merge completed, saved: {result.get('merged')}\n", flush=True)
-            logger.info("[SCREEN RECORDING] Merge completed: %s", result.get("merged"))
+    """End test: merge chunks with FFmpeg in a background task."""
+    logger.info("end_test received: triggering background merging for %s/%s/%s", client_id, position_id, candidate_id)
+    
+    async def run_merges():
+        # 1. Merge screen recording
+        logger.info("[MERGE] Starting screen recording merge for %s/%s/%s", client_id, position_id, candidate_id)
+        res_screen = await asyncio.to_thread(do_merge_chunks, client_id, position_id, candidate_id)
+        if res_screen.get("success"):
+            logger.info("[MERGE] Screen recording merge completed: %s", res_screen.get("merged"))
         else:
-            print(f"[SCREEN RECORDING] Merge failed: {result.get('error')}\n", flush=True)
+            logger.warning("[MERGE] Screen recording merge failed: %s", res_screen.get("error"))
 
-        # Also merge camera recording chunks (best-effort, non-blocking)
-        camera_result = {"success": False}
-        try:
-            camera_result = await asyncio.to_thread(
-                do_merge_chunks,
-                client_id, position_id, candidate_id,
-                file_prefix="camera_part_",
-                output_prefix="camera_recording",
-            )
-            if camera_result.get("success"):
-                logger.info(f"Camera recording merged: {camera_result.get('merged')}")
-            else:
-                logger.warning(f"Camera merge skipped/failed: {camera_result.get('error')}")
-        except Exception as cam_err:
-            logger.warning(f"Camera merge error (non-fatal): {cam_err}")
+        # 2. Merge camera recording
+        logger.info("[MERGE] Starting camera recording merge for %s/%s/%s", client_id, position_id, candidate_id)
+        res_camera = await asyncio.to_thread(
+            do_merge_chunks,
+            client_id, position_id, candidate_id,
+            file_prefix="camera_part_",
+            output_prefix="camera_recording"
+        )
+        if res_camera.get("success"):
+            logger.info("[MERGE] Camera recording merge completed: %s", res_camera.get("merged"))
+        else:
+            logger.warning("[MERGE] Camera recording merge failed: %s", res_camera.get("error"))
 
-        if result.get("success"):
-            return {
-                "success": True,
-                "message": "Merge completed",
-                "merged": result.get("merged"),
-                "session": result.get("session"),
-                "camera_merged": camera_result.get("merged"),
-            }
-        return {"success": False, "error": result.get("error", "Merge failed")}
-    except Exception as err:
-        logger.exception("Merge failed")
-        return {"success": False, "error": str(err)}
+    background_tasks.add_task(run_merges)
+    
+    return {
+        "success": True,
+        "message": "Merge job started in background.",
+    }
 
 
 def _compute_next_round(summary_data: dict) -> tuple:
@@ -792,33 +879,20 @@ def _full_url(method: str, url: str, params: Optional[dict] = None) -> str:
 
 
 def _log_ws_api(api_name: str, method: str, url: str, payload: dict, response_status: int, response_body, params: Optional[dict] = None):
-    """Log complete WebSocket-triggered API call and full response (request + response) to terminal."""
+    """Log one-line concise WebSocket-triggered API call and response summary."""
     try:
-        body_str = json.dumps(response_body, indent=2) if response_body is not None else str(response_body)
-    except Exception:
-        body_str = str(response_body)
-    payload_str = json.dumps(payload, indent=2) if payload else "{}"
-    query_params = params if params is not None else (payload.get("params") if isinstance(payload, dict) else None)
-    full_url_str = _full_url(method, url, query_params)
-    max_response_len = 12000
-    response_preview = body_str if len(body_str) <= max_response_len else body_str[:max_response_len] + "\n... (truncated)"
-    sep = "=" * 64
-    block = (
-        f"\n{sep}\n"
-        f"  COMPLETE API CALL (WebSocket-triggered)\n"
-        f"  Name: {api_name}\n"
-        f"{sep}\n"
-        f"  REQUEST:\n"
-        f"    Method:  {method}\n"
-        f"    URL:     {full_url_str}\n"
-        f"    Payload/Body:\n{payload_str}\n"
-        f"  RESPONSE:\n"
-        f"    Status:  {response_status}\n"
-        f"    Body:\n{response_preview}\n"
-        f"{sep}\n"
-    )
-    print(block, flush=True)
-    logger.info("[WS API] %s | %s %s -> %s", api_name, method, full_url_str, response_status)
+        query_params = params if params is not None else (payload.get("params") if isinstance(payload, dict) else None)
+        full_url_str = _full_url(method, url, query_params)
+        
+        # One-line summary
+        resp_str = json.dumps(response_body) if response_body is not None else "None"
+        if len(resp_str) > 150: resp_str = resp_str[:150] + "..."
+        
+        log_line = f"[API LOG] {api_name} | {method} {full_url_str} -> {response_status} | Payload: {json.dumps(payload)} | Resp: {resp_str}"
+        print(log_line, flush=True)
+        logger.info(log_line)
+    except Exception as e:
+        print(f"[LOG ERROR] Failed to log API call: {e}", flush=True)
 
 
 # --- WebSocket: Proctoring events (no_face, multiple_faces, head_turned) ---
@@ -906,6 +980,8 @@ async def websocket_test_session(websocket: WebSocket):
                 session["tenant_id"] = msg.get("tenant_id")
                 # Store is_conversational from init (client sends it after email/OTP verify); session is source of truth
                 session["is_conversational"] = bool(msg.get("is_conversational"))
+                # Cross-question counts: start with frontend-provided values as baseline,
+                # then override with authoritative DB values during the init sequence below.
                 session["cross_question_count_general"] = min(4, max(1, int(msg.get("cross_question_count_general") or 2)))
                 session["cross_question_count_position"] = min(4, max(1, int(msg.get("cross_question_count_position") or 2)))
                 logger.info("Test session init (client_id, position_id, candidate_id): %s", {
@@ -918,6 +994,19 @@ async def websocket_test_session(websocket: WebSocket):
                 tenant_id = session.get("tenant_id") or ""
                 cand_id = session.get("candidate_id")
                 pos_id = session.get("position_id")
+                # Fetch cross-question settings from AdminBackend DB (authoritative source).
+                # Overrides any frontend-sent values so the count always matches AdminFrontend settings.
+                if admin_url and session.get("client_id") and tenant_id:
+                    try:
+                        cq_settings = await admin_get_cross_question_settings(
+                            admin_url, session["client_id"], tenant_id
+                        )
+                        session["cross_question_count_general"] = cq_settings["crossQuestionCountGeneral"]
+                        session["cross_question_count_position"] = cq_settings["crossQuestionCountPosition"]
+                        logger.info("[init] Cross-question settings from DB: general=%s position=%s",
+                                    session["cross_question_count_general"], session["cross_question_count_position"])
+                    except Exception as _cq_e:
+                        logger.warning("[init] Cross-question settings DB fetch failed (keeping frontend values): %s", _cq_e)
                 if admin_url and cand_id and pos_id:
                     try:
                         url = f"{admin_url.rstrip('/')}/candidates/assessment-summaries"
@@ -998,16 +1087,17 @@ async def websocket_test_session(websocket: WebSocket):
                 screening_cache = session.get("screening_cache") or {}
                 
                 try:
-                    get_url = f"{cand_url}/candidate-interviews/candidate/{cid}/position/{pid}"
-                    params = {"questionSetId": qset_id}
-                    r_status, get_body = await candidate_get_interview(cand_url, cid, pid, qset_id)
-                    _log_ws_api("GET candidate-interviews (get_screening)", "GET", get_url, {"params": params}, r_status, get_body)
+                    get_url = f"{cand_url}/candidate/assessment-summary"
+                    params = {"candidateId": cid, "positionId": pid, "questionSetId": qset_id}
+                    tenant_id = session.get("tenant_id") or ""
+                    r_status, get_body = await candidate_get_interview(cand_url, cid, pid, qset_id, tenant_id=tenant_id)
+                    _log_ws_api("GET assessment-summary (get_screening)", "GET", get_url, {"params": params}, r_status, get_body)
                     if r_status == 404:
                         # First time: get question set, build categories with answer "", POST
                         if not admin_url:
                             await websocket.send_json({"type": "error", "message": "Admin backend not configured"})
                             continue
-                        sections_url = f"{admin_url}/admins/question-sections/question-set/{qset_id}"
+                        sections_url = f"{admin_url}/internal/question-sections/question-set/{qset_id}"
                         sr_status, sections_json = await admin_get_question_sections(admin_url, qset_id, tenant_id)
                         _log_ws_api("GET question-sections (get_screening first-time)", "GET", sections_url, {}, sr_status, sections_json)
                         if sr_status != 200:
@@ -1015,19 +1105,22 @@ async def websocket_test_session(websocket: WebSocket):
                             continue
                         raw = sections_json.get("data") or {}
                         section_row = raw[0] if isinstance(raw, list) and len(raw) > 0 else raw
-                        categories = build_screening_categories_from_sections(section_row)
-                        post_url = f"{cand_url}/candidate-interviews"
+                        # Note: assessments_summary in MySQL doesn't use categories/doc model as heavily as MongoDB,
+                        # but we keep the logic for backward compatibility if the backend handles it.
+                        post_url = f"{cand_url}/candidate/assessment-summary"
                         post_payload = {
                             "candidateId": cid,
                             "positionId": pid,
-                            "questionSetId": qset_id,
-                            "clientId": client_id,
-                            "categories": categories,
-                            "isScreeningCompleted": False,
-                            "type": "CONVERSATIONAL",
+                            "questionId": qset_id,
+                            "totalRoundsAssigned": 4,
+                            "round1Assigned": 1,
+                            "round2Assigned": 1,
+                            "round3Assigned": 1,
+                            "round4Assigned": 1
                         }
-                        pr_status, post_body = await candidate_post_interview(cand_url, post_payload)
-                        _log_ws_api("POST candidate-interviews (get_screening first-time)", "POST", post_url, post_payload, pr_status, post_body)
+                        tenant_id = session.get("tenant_id") or ""
+                        pr_status, post_body = await candidate_post_interview(cand_url, post_payload, tenant_id=tenant_id)
+                        _log_ws_api("POST assessment-summary (get_screening first-time)", "POST", post_url, post_payload, pr_status, post_body)
                         if pr_status not in (200, 201):
                             await websocket.send_json({"type": "error", "message": "Failed to create screening"})
                             continue
@@ -1096,7 +1189,8 @@ async def websocket_test_session(websocket: WebSocket):
                             tenant_id = session.get("tenant_id") or ""
                             admin_url = getattr(config, "ADMIN_BACKEND_URL", None)
                             get_url = f"{cand_url}/candidate-interviews/candidate/{cid}/position/{pid}"
-                            r_status, get_body = await candidate_get_interview(cand_url, cid, pid, qset_id)
+                            tenant_id = session.get("tenant_id") or ""
+                            r_status, get_body = await candidate_get_interview(cand_url, cid, pid, qset_id, tenant_id=tenant_id)
                             if r_status == 404 and admin_url:
                                 section_row = {}
                                 try:
@@ -1111,7 +1205,7 @@ async def websocket_test_session(websocket: WebSocket):
                                     "candidateId": cid, "positionId": pid, "questionSetId": qset_id,
                                     "clientId": session.get("client_id"), "categories": categories_new,
                                     "isScreeningCompleted": False, "type": "CONVERSATIONAL",
-                                })
+                                }, tenant_id=tenant_id)
                                 if 200 <= pr_status < 300 and post_body:
                                     screening_cache[cache_key] = {"id": post_body.get("id"), "doc": post_body}
                             elif r_status == 200:
@@ -1146,29 +1240,31 @@ async def websocket_test_session(websocket: WebSocket):
                                 pair_idx = 0
                             if conv_key in conv_sets and isinstance(conv_sets[conv_key], list) and pair_idx is not None and pair_idx < len(conv_sets[conv_key]):
                                 conv_sets[conv_key][pair_idx]["answer"] = answer or ""
-                                put_url = f"{cand_url}/candidate-interviews/{session['screening_id']}"
-                                put_payload = {"categories": categories}
+                                put_url = f"{cand_url}/candidate/assessment-summary"
+                                tenant_id = session.get("tenant_id") or ""
                                 r_status, resp_body = await candidate_put_interview(
-                                    cand_url, session["screening_id"], put_payload
+                                    cand_url, session["screening_id"], {"candidateId": session.get("candidate_id"), "positionId": session.get("position_id"), "categories": categories}, tenant_id=tenant_id
                                 )
-                                _log_ws_api("PUT candidate-interviews (submit_answer)", "PUT", put_url, put_payload, r_status, resp_body)
+                                _log_ws_api("PATCH assessment-summary (submit_answer)", "PATCH", put_url, {"categories": "..."}, r_status, resp_body)
                                 if 200 <= r_status < 300:
                                     answer_saved_ok = True
                                     print(f"\n[ANSWER SAVED] round={round_str} question_id={question_id} flat={flat_index} (screening)\n", flush=True)
                                     try:
-                                        get_url = f"{cand_url}/candidate-interviews/candidate/{session.get('candidate_id')}/position/{session.get('position_id')}"
+                                        get_url = f"{cand_url}/candidate/assessment-summary"
+                                        tenant_id = session.get("tenant_id") or ""
                                         get_status, fresh_doc = await candidate_get_interview(
                                             cand_url,
                                             session.get("candidate_id"),
                                             session.get("position_id"),
                                             session.get("question_set_id") or "",
+                                            tenant_id=tenant_id
                                         )
                                         if get_status == 200:
                                             # Update both cache and session
                                             screening_cache[cache_key] = {"id": fresh_doc.get("id"), "doc": fresh_doc}
                                             session["screening_cache"] = screening_cache
                                             session["screening_doc"] = fresh_doc
-                                            _log_ws_api("GET candidate-interviews (after save, for next question)", "GET", get_url, None, get_status, fresh_doc)
+                                            _log_ws_api("GET assessment-summary (after save)", "GET", get_url, None, get_status, fresh_doc)
                                         else:
                                             # Update both cache and session
                                             screening_cache[cache_key] = {"id": resp_body.get("id"), "doc": resp_body}
@@ -1182,11 +1278,11 @@ async def websocket_test_session(websocket: WebSocket):
                                         session["screening_doc"] = resp_body
                                 else:
                                     logger.warning("submit_answer PUT failed: %s %s", r_status, resp_body)
-                                    print(f"\n[ANSWER SAVE FAILED] PUT %s round={round_str} question_id={question_id}\n", r.status_code, flush=True)
+                                    print(f"\n[ANSWER SAVE FAILED] PUT %s round={round_str} question_id={question_id}\n", r_status, flush=True)
                             else:
                                 logger.warning("submit_answer: conv_key=%s pair_idx=%s not valid in screening_doc", conv_key, pair_idx)
                         except Exception as e:
-                            _log_ws_api("submit_answer (screening) FAILED", "PUT", f"{cand_url or ''}/candidate-interviews/{session.get('screening_id') or ''}", {}, 0, {"error": str(e)})
+                            _log_ws_api("submit_answer (screening) FAILED", "PATCH", f"{cand_url or ''}/candidate/assessment-summary", {}, 0, {"error": str(e)})
                             logger.exception("submit_answer screening update failed: %s", e)
                             print(f"\n[ANSWER SAVE FAILED] round={round_str} question_id={question_id} error={e}\n", flush=True)
                 elif cand_url and round_num not in (1, 2):
@@ -1217,7 +1313,8 @@ async def websocket_test_session(websocket: WebSocket):
                             payload["correctAnswer"] = _correct
                     url = f"{cand_url.rstrip('/')}/public/question-answers"
                     try:
-                        r_status, resp_body = await candidate_post_question_answer(cand_url, payload)
+                        tenant_id = session.get("tenant_id") or ""
+                        r_status, resp_body = await candidate_post_question_answer(cand_url, payload, tenant_id=tenant_id)
                         _log_ws_api("POST question-answers (submit_answer)", "POST", url, payload, r_status, resp_body)
                         if 200 <= r_status < 300:
                             answer_saved_ok = True
@@ -1267,11 +1364,11 @@ async def websocket_test_session(websocket: WebSocket):
                                         _sa_ci = sort_conv_key(conv_key_for_cross) - 1
                                         _sa_at, _sa_pt = _sa_t_list[_sa_ci] if 0 <= _sa_ci < len(_sa_t_list) else (120, 5)
                                         conv_c[conv_key_for_cross].append({"question": new_q, "answer": "", "answerTime": _sa_at, "prepareTime": _sa_pt})
-                                        put_url_c = f"{cand_url}/candidate-interviews/{session['screening_id']}"
+                                        put_url_c = f"{cand_url}/candidate/assessment-summary"
                                         r_c_status, _ = await candidate_put_interview(
-                                            cand_url, session["screening_id"], {"categories": categories_cross}
+                                            cand_url, session["screening_id"], {"candidateId": session.get("candidate_id"), "positionId": session.get("position_id"), "categories": categories_cross}, tenant_id=tenant_id
                                         )
-                                        _log_ws_api("PUT candidate-interviews (append cross-question)", "PUT", put_url_c, {"cross_question": new_q[:80]}, r_c_status, {})
+                                        _log_ws_api("PATCH assessment-summary (append cross-question)", "PATCH", put_url_c, {"cross_question": new_q[:80]}, r_c_status, {})
                                         if 200 <= r_c_status < 300:
                                             try:
                                                 get_status2, fresh_doc2 = await candidate_get_interview(
@@ -1279,6 +1376,7 @@ async def websocket_test_session(websocket: WebSocket):
                                                     session.get("candidate_id"),
                                                     session.get("position_id"),
                                                     session.get("question_set_id") or "",
+                                                    tenant_id=tenant_id
                                                 )
                                                 if get_status2 == 200:
                                                     # Update both cache and session
@@ -1338,35 +1436,38 @@ async def websocket_test_session(websocket: WebSocket):
                 # Round 1 & 2: use screening document (ensure we have it, then return questions in order with answer field)
                 if rn in (1, 2) and cand_url and cid and pid and qset_id:
                     try:
-                        # Create cache key for this specific exam instance
-                        assessment_summary_id = session.get("assessment_summary_id") or ""
-                        cache_key = f"{pid}_{cid}_{qset_id}_{assessment_summary_id}"
-                        screening_cache = session.get("screening_cache") or {}
-                        
-                        # Check if we have cached screening for this exact exam instance
-                        if cache_key not in screening_cache:
-                            r_status, get_body = await candidate_get_interview(cand_url, cid, pid, qset_id)
+                        # Use ir_cache (session-level) to avoid repeated GETs.
+                        # ir_cache is also updated on every answer PATCH in submit_and_next,
+                        # so get_round_questions always sees fresh answers after a submit.
+                        ir_cache_key = f"{pid}_{cid}"
+                        ir_cache = session.get("ir_cache") or {}
+
+                        logger.info(f"[Round {rn}] get_round_questions: cached={ir_cache_key in ir_cache}")
+
+                        if ir_cache_key not in ir_cache:
+                            r_status, get_body = await ir_get(cand_url, cid, pid, tenant_id=tenant_id)
+                            logger.info(f"[Round {rn}] GET interview-responses: status={r_status}, has_categories={isinstance((get_body or {}).get('categories'), dict)}")
                             if r_status == 404 and admin_url:
+                                # First visit — build empty categories from admin, POST to MongoDB
                                 sr_status, sr_json = await admin_get_question_sections(admin_url, qset_id, tenant_id)
                                 raw = (sr_json.get("data") or []) if sr_status == 200 else []
                                 section_row = raw[0] if isinstance(raw, list) and raw else {}
                                 categories = build_screening_categories_from_sections(section_row)
-                                pr_status, post_body = await candidate_post_interview(cand_url, {
+                                pr_status, post_body = await ir_post(cand_url, {
                                     "candidateId": cid, "positionId": pid, "questionSetId": qset_id,
-                                    "clientId": session.get("client_id"), "categories": categories, "isScreeningCompleted": False,
-                                })
+                                    "categories": categories,
+                                }, tenant_id=tenant_id)
+                                logger.info(f"[Round {rn}] POST interview-responses: status={pr_status}")
                                 if 200 <= pr_status < 300 and post_body:
-                                    screening_cache[cache_key] = {"id": post_body.get("id"), "doc": post_body}
+                                    ir_cache[ir_cache_key] = post_body
                             elif r_status == 200:
-                                screening_cache[cache_key] = {"id": get_body.get("id"), "doc": get_body}
-                            session["screening_cache"] = screening_cache
-                        
-                        # Get screening for current exam instance
-                        cached_screening = screening_cache.get(cache_key, {})
-                        session["screening_id"] = cached_screening.get("id")
-                        session["screening_doc"] = cached_screening.get("doc")
-                        doc = session.get("screening_doc") or {}
+                                ir_cache[ir_cache_key] = get_body
+                            session["ir_cache"] = ir_cache
+
+                        doc = ir_cache.get(ir_cache_key) or {}
                         flat_qa = build_flat_qa_list(doc, rn)
+                        logger.info(f"[Round {rn}] flat_qa: count={len(flat_qa)}, answered={sum(1 for *_, a in flat_qa if a.strip())}")
+                        
                         # Enrich each question with timeToPrepare / timeToAnswer from Admin question-sections
                         _t_cache_key = f"q_timing_{qset_id}_{rn}"
                         _t_list = session.get(_t_cache_key)
@@ -1378,8 +1479,14 @@ async def websocket_test_session(websocket: WebSocket):
                                     _ts_d = _ts_d[0] if isinstance(_ts_d, list) and _ts_d else (_ts_d if isinstance(_ts_d, dict) else {})
                                     _ts_qs = questions_for_round(_ts_d, rn) or []
                                     _t_list = [
-                                        (int(_q.get("answerTime", 120)) if isinstance(_q, dict) else 120,
-                                         int(_q.get("prepareTime", 5)) if isinstance(_q, dict) else 5)
+                                        (
+                                            parse_seconds((_q or {}).get("answerTime", (_q or {}).get("timeToAnswer")), 120)
+                                            if isinstance(_q, dict)
+                                            else 120,
+                                            parse_seconds((_q or {}).get("prepareTime", (_q or {}).get("timeToPrepare")), 10)
+                                            if isinstance(_q, dict)
+                                            else 10,
+                                        )
                                         for _q in _ts_qs
                                     ]
                                     session[_t_cache_key] = _t_list
@@ -1393,32 +1500,41 @@ async def websocket_test_session(websocket: WebSocket):
                             _at, _pt = _t_list[_ci] if 0 <= _ci < len(_t_list) else (120, 5)
                             questions_ordered.append({"question": q, "answer": a, "timeToAnswer": _at, "timeToPrepare": _pt})
 
-                        # Fallback: if screening fetch failed (e.g. candidate-interviews 500) or empty, serve questions directly from Admin question-sections
+                        # Fallback: if screening fetch failed or empty, serve questions directly from Admin question-sections
                         if len(questions_ordered) == 0 and admin_url:
+                            logger.info("get_round_questions: questions_ordered is empty, attempting fallback to Admin question-sections (qset_id=%s)", qset_id)
                             try:
                                 fb_status, fb_json = await admin_get_question_sections(admin_url, qset_id, tenant_id or "")
+                                logger.info("get_round_questions: Admin fallback status=%s data_keys=%s", fb_status, list(fb_json.get("data", [{}])[0].keys()) if fb_json.get("data") else "none")
                                 if fb_status == 200 and fb_json:
                                     fb_raw = fb_json.get("data") or {}
                                     fb_data = fb_raw[0] if isinstance(fb_raw, list) and len(fb_raw) > 0 else fb_raw
                                     fb_questions = questions_for_round(fb_data, rn) or []
+                                    logger.info("get_round_questions: Extracted %s questions from fallback data", len(fb_questions))
                                     mapped = []
                                     for i, item in enumerate(fb_questions):
-                                        _fb_at = int(item.get("answerTime", 120)) if isinstance(item, dict) else 120
-                                        _fb_pt = int(item.get("prepareTime", 5)) if isinstance(item, dict) else 5
-                                        # Use already-cached timing if available (takes precedence)
-                                        if 0 <= i < len(_t_list):
-                                            _fb_at, _fb_pt = _t_list[i]
-                                        if isinstance(item, dict):
-                                            mapped.append({"question": (item.get("question") or "").strip(), "answer": "", "timeToAnswer": _fb_at, "timeToPrepare": _fb_pt})
-                                        else:
-                                            mapped.append({"question": str(item), "answer": "", "timeToAnswer": _fb_at, "timeToPrepare": _fb_pt})
+                                        _fb_at = parse_seconds(item.get("answerTime", item.get("timeToAnswer")), 120) if isinstance(item, dict) else 120
+                                        _fb_pt = parse_seconds(item.get("prepareTime", item.get("timeToPrepare")), 10) if isinstance(item, dict) else 10
+                                        if 0 <= i < len(_t_list): _fb_at, _fb_pt = _t_list[i]
+                                        q_text = (item.get("question") or "").strip() if isinstance(item, dict) else str(item).strip()
+                                        mapped.append({"question": q_text, "answer": "", "timeToAnswer": _fb_at, "timeToPrepare": _fb_pt})
                                     questions_ordered = mapped
-                                    logger.warning("get_round_questions: fallback to question-sections used (round=%s, count=%s)", round_num, len(questions_ordered))
                             except Exception as fb_err:
                                 logger.warning("get_round_questions fallback failed: %s", fb_err)
 
-                        await websocket.send_json({"type": "round_questions", "round": round_num, "questions": questions_ordered})
-                        print(f"[WS OUT] sent round_questions from screening (round={round_num}, count={len(questions_ordered)})\n", flush=True)
+                        # Calculate total round time from the questions if it's missing or zero
+                        total_time_sec = sum((q.get("timeToAnswer", 120) + q.get("timeToPrepare", 5)) for q in questions_ordered)
+                        mm, ss = divmod(total_time_sec, 60)
+                        hh, mm = divmod(mm, 60)
+                        total_time_str = f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+                        await websocket.send_json({
+                            "type": "round_questions", 
+                            "round": round_num, 
+                            "questions": questions_ordered,
+                            "totalTime": total_time_str
+                        })
+                        print(f"[WS OUT] sent round_questions (round={round_num}, count={len(questions_ordered)}, time={total_time_str})\n", flush=True)
                     except Exception as e:
                         logger.exception("get_round_questions screening failed: %s", e)
                         await websocket.send_json({"type": "round_questions", "round": round_num, "questions": []})
@@ -1427,7 +1543,7 @@ async def websocket_test_session(websocket: WebSocket):
                     await websocket.send_json({"type": "round_questions", "round": round_num, "questions": []})
                     continue
                 try:
-                    url = f"{admin_url.rstrip('/')}/admins/question-sections/question-set/{qset_id}"
+                    url = f"{admin_url.rstrip('/')}/internal/question-sections/question-set/{qset_id}"
                     payload = {"round": round_num, "headers": {"X-Tenant-Id": tenant_id or ""}}
                     r_status, resp_json = await admin_get_question_sections(admin_url, qset_id, tenant_id or "")
                     _log_ws_api("GET question-sections (get_round_questions)", "GET", url, payload, r_status, resp_json)
@@ -1437,6 +1553,11 @@ async def websocket_test_session(websocket: WebSocket):
                         continue
                     raw = resp_json.get("data") or {}
                     data = raw[0] if isinstance(raw, list) and len(raw) > 0 else raw
+                except Exception as e:
+                    _log_ws_api("GET question-sections (get_round_questions) FAILED", "GET", url, payload, 0, {"error": str(e)})
+                    logger.exception("get_round_questions failed: %s", e)
+                    await websocket.send_json({"type": "round_questions", "round": round_num, "questions": []})
+                    continue
                     # ── Round 4 (Aptitude): generate MCQ questions via AI ──────────────
                     if rn == 4:
                         cache_key = f"aptitude_qs_{qset_id}_{cid}_{pid}"
@@ -1458,6 +1579,7 @@ async def websocket_test_session(websocket: WebSocket):
                                         "candidateId": cid,
                                         "positionId": pid,
                                         "questionSetId": qset_id,
+                                        "tenantId": tenant_id
                                     })
                                 print(f"[Round 4] MongoDB fetch status: {_r.status_code}\n", flush=True)
                                 if _r.status_code == 200:
@@ -1494,6 +1616,7 @@ async def websocket_test_session(websocket: WebSocket):
                                             "questionSetId": qset_id,
                                             "totalQuestions": len(generated),
                                             "generatedQuestions": generated,
+                                            "tenantId": tenant_id
                                         })
                                     if 200 <= _save_r.status_code < 300:
                                         print(f"[Round 4] ✅ saved {len(generated)} questions to MongoDB (status {_save_r.status_code})\n", flush=True)
@@ -1534,7 +1657,7 @@ async def websocket_test_session(websocket: WebSocket):
                 url = f"{cand_url.rstrip('/')}/public/question-answers"
                 print(f"[WS] Calling CandidateBackend: GET {url} (params: {params})\n", flush=True)
                 try:
-                    r_status, body = await candidate_get_question_answers(cand_url, params)
+                    r_status, body = await candidate_get_question_answers(cand_url, params, tenant_id=tenant_id)
                     _log_ws_api("GET question-answers (get_saved_answers)", "GET", url, {"params": params}, r_status, body)
                     if r_status == 404:
                         await websocket.send_json({"type": "saved_answers", "round": round_param, "answers": []})
@@ -1561,11 +1684,34 @@ async def websocket_test_session(websocket: WebSocket):
                     await websocket.send_json({"type": "proctoring_result", "event": "ok", "confidence": 0.0})
                     continue
                 try:
-                    raw = base64.b64decode(image_b64)
-                    result = await asyncio.to_thread(face_detection_analyze, raw)
+                    result = await asyncio.to_thread(face_detection_analyze, image_b64)
                     event = result.get("event", "ok")
                     confidence = float(result.get("confidence", 0))
                     logger.info("Proctoring result: %s (confidence=%.2f)", event, confidence)
+                    
+                    # Automated violation screenshot storage
+                    if event != "ok":
+                        try:
+                            client_id = session.get("client_id")
+                            position_id = session.get("position_id")
+                            candidate_id = session.get("candidate_id")
+                            if client_id and position_id and candidate_id:
+                                # Save screenshot to a subfolder named after the event
+                                dir_path = _screenshot_path(client_id, position_id, candidate_id) / event
+                                dir_path.mkdir(parents=True, exist_ok=True)
+                                
+                                # Decode the image for local saving
+                                header, encoded = image_b64.split(",", 1) if "," in image_b64 else ("", image_b64)
+                                img_bytes = base64.b64decode(encoded)
+                                
+                                name = f"violation_{event}_{int(time.time() * 1000)}.png"
+                                file_path = dir_path / name
+                                with open(file_path, "wb") as f:
+                                    f.write(img_bytes)
+                                logger.info("Violation screenshot saved: %s", name)
+                        except Exception as ss_err:
+                            logger.error("Failed to save violation screenshot: %s", ss_err)
+
                     await websocket.send_json({
                         "type": "proctoring_result",
                         "event": event,
@@ -1593,6 +1739,30 @@ async def websocket_test_session(websocket: WebSocket):
                 except Exception as e:
                     logger.exception("start_listening failed: %s", e)
                     await websocket.send_json({"type": "transcript", "error": str(e)})
+            elif msg_type == "speak":
+                text = msg.get("text")
+                voice = msg.get("voice", "en-US-AvaMultilingualNeural")
+                if not text:
+                    continue
+                try:
+                    communicate = edge_tts.Communicate(text, voice)
+                    audio_data = b""
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            audio_data += chunk["data"]
+                    
+                    if audio_data:
+                        b64_audio = base64.b64encode(audio_data).decode("utf-8")
+                        await websocket.send_json({
+                            "type": "tts_audio",
+                            "audio": b64_audio,
+                            "text": text
+                        })
+                        print(f"[WS OUT] sent tts_audio ({len(audio_data)} bytes) for text: {text[:50]}...\n", flush=True)
+                except Exception as e:
+                    logger.error("WebSocket TTS failed: %s", e)
+                    await websocket.send_json({"type": "tts_error", "message": str(e)})
+
             elif msg_type == "audio_chunk":
                 # PCM audio (base64) → forward to AssemblyAI runner
                 runner = session.get("assemblyai_runner")
@@ -1623,10 +1793,12 @@ async def websocket_test_session(websocket: WebSocket):
                 question_id = msg.get("questionId")
                 answer = msg.get("answer", "")
                 is_conversational = msg.get("isConversational", False)
-                cross_general = msg.get("crossQuestionCountGeneral", 2)
-                cross_position = msg.get("crossQuestionCountPosition", 2)
+                # Use AUTHORITATIVE DB values from session (set during init), NOT frontend message parameters
+                # This ensures the admin-configured cross question limits are enforced exactly
+                cross_general = session.get("cross_question_count_general", 2)
+                cross_position = session.get("cross_question_count_position", 2)
                 
-                logger.info(f"[WS] submit_and_next: Round {round_num} | Q#{question_id} | isConversational={is_conversational}")
+                logger.info(f"[WS] submit_and_next: Round {round_num} | Q#{question_id} | isConversational={is_conversational} | crossGeneral={cross_general} crossPosition={cross_position}")
                 
                 if round_num not in (1, 2):
                     await websocket.send_json({"type": "error", "message": "round must be 1 or 2"})
@@ -1644,127 +1816,88 @@ async def websocket_test_session(websocket: WebSocket):
                 tenant_id = session.get("tenant_id", "")
                 
                 flat_index = int(question_id) if str(question_id).isdigit() else 0
-                
-                # 1) GET or create screening doc (handle 404 AND intermittent 5xx)
-                try:
-                    r_status, get_body = await candidate_get_interview(cand_url, cid, pid, qset_id)
-                    screening_id = None
-                    doc = None
-                    _in_memory = False  # True when MongoDB unavailable — answers stored in session only
 
-                    if r_status == 200:
-                        screening_id = get_body.get("id")
-                        doc = get_body
-                    else:
-                        # 404 (no doc yet) OR 5xx (intermittent MongoDB error) — try to create
-                        if r_status != 404:
-                            logger.warning("submit_and_next: candidate-interviews GET returned %s, treating as 404 to create doc", r_status)
-                        section_row = {}
-                        if admin_url:
-                            try:
-                                sr_status, sr_json = await admin_get_question_sections(admin_url, qset_id, tenant_id)
-                                if sr_status == 200 and sr_json:
-                                    raw = (sr_json.get("data") or [])
-                                    section_row = raw[0] if isinstance(raw, list) and raw else {}
-                            except Exception:
-                                pass
-                        categories_new = build_screening_categories_from_sections(section_row)
-                        try:
-                            pr_status, post_body = await candidate_post_interview(cand_url, {
-                                "candidateId": cid, "positionId": pid, "questionSetId": qset_id,
-                                "clientId": session.get("client_id", ""), "categories": categories_new,
-                                "isScreeningCompleted": False, "type": "CONVERSATIONAL",
-                            })
-                        except Exception as post_err:
-                            pr_status, post_body = 0, {}
-                            logger.warning("submit_and_next: candidate-interviews POST failed: %s", post_err)
-                        if 200 <= pr_status < 300 and post_body:
-                            screening_id = post_body.get("id")
-                            doc = post_body
+                # Session ir_cache: avoid extra GETs; updated after every PATCH
+                ir_cache_key = f"{pid}_{cid}"
+                ir_cache = session.get("ir_cache") or {}
+
+                try:
+                    # 1) Ensure interview-responses doc is loaded (MongoDB via CandidateBackend)
+                    doc = ir_cache.get(ir_cache_key)
+                    if doc is None:
+                        r_status, get_body = await ir_get(cand_url, cid, pid, tenant_id=tenant_id)
+                        if r_status == 200:
+                            doc = get_body
                         else:
-                            # MongoDB fully unavailable — use in-memory fallback doc
-                            logger.warning("submit_and_next: POST also failed (%s), using in-memory doc", pr_status)
-                            _in_memory = True
-                            cache_key_mem = f"{pid}_{cid}_{qset_id}_{session.get('assessment_summary_id', '')}"
-                            mem_cache = session.get("mem_screening_cache") or {}
-                            if cache_key_mem in mem_cache:
-                                doc = mem_cache[cache_key_mem]
+                            # 404 or error — build from admin questions and create in MongoDB
+                            categories_new = {}
+                            if admin_url:
+                                try:
+                                    sr_status, sr_json = await admin_get_question_sections(admin_url, qset_id, tenant_id)
+                                    if sr_status == 200 and sr_json:
+                                        raw = (sr_json.get("data") or [])
+                                        section_row = raw[0] if isinstance(raw, list) and raw else {}
+                                        categories_new = build_screening_categories_from_sections(section_row)
+                                except Exception:
+                                    pass
+                            pr_status, post_body = await ir_post(cand_url, {
+                                "candidateId": cid, "positionId": pid, "questionSetId": qset_id,
+                                "categories": categories_new,
+                            }, tenant_id=tenant_id)
+                            if 200 <= pr_status < 300 and post_body:
+                                doc = post_body
                             else:
+                                # MongoDB unavailable — work fully in-memory for this session
                                 doc = {"candidateId": cid, "positionId": pid, "questionSetId": qset_id,
                                        "categories": categories_new, "isScreeningCompleted": False}
-                                mem_cache[cache_key_mem] = doc
-                                session["mem_screening_cache"] = mem_cache
+                        ir_cache[ir_cache_key] = doc
+                        session["ir_cache"] = ir_cache
 
-                    # 2) Update answer in categories
-                    raw_cats = (doc or {}).get("categories") or {}
-                    if not isinstance(raw_cats, dict):
-                        raw_cats = {}
-                    categories = json.loads(json.dumps(raw_cats))
                     cat_key = "generalQuestion" if round_num == 1 else "positionSpecificQuestion"
-                    if cat_key not in categories:
-                        categories[cat_key] = {}
-                    cat = categories[cat_key]
-                    if "conversationSets" not in cat:
-                        cat["conversationSets"] = {}
-                    conv_sets = cat["conversationSets"]
+
+                    # 2) Resolve conv_key / pair_idx from flat_index
                     conv_key, pair_idx = flat_index_to_conv_and_pair(doc, round_num, flat_index)
                     if conv_key is None:
                         conv_key = f"conversationQuestion{flat_index + 1}"
                         pair_idx = 0
-                    # Ensure the conv_set entry exists (create if missing)
-                    if conv_key not in conv_sets or not isinstance(conv_sets[conv_key], list):
-                        conv_sets[conv_key] = [{"question": "", "answer": ""}]
-                        pair_idx = 0
-                    if pair_idx is None or pair_idx >= len(conv_sets[conv_key]):
-                        conv_sets[conv_key].append({"question": "", "answer": ""})
-                        pair_idx = len(conv_sets[conv_key]) - 1
 
-                    conv_sets[conv_key][pair_idx]["answer"] = answer
+                    # 3) Persist answer — targeted PATCH (only updates this one Q&A pair)
+                    patch_status, patch_body = await ir_patch(cand_url, {
+                        "candidateId": cid, "positionId": pid,
+                        "round": round_num, "convKey": conv_key,
+                        "pairIdx": pair_idx, "answer": answer,
+                    }, tenant_id=tenant_id)
 
-                    # 3) Persist to MongoDB (skip if in-memory fallback)
-                    if not _in_memory and screening_id:
-                        put_status, put_body = await candidate_put_interview(cand_url, screening_id, {"categories": categories})
-                        if put_status < 200 or put_status >= 300:
-                            logger.warning("submit_and_next: PUT failed (%s), saving answer in-memory", put_status)
-                            _in_memory = True
-                        else:
-                            logger.info(f"[WS] Answer saved to MongoDB: Round {round_num} Q#{question_id}")
+                    if 200 <= patch_status < 300 and patch_body:
+                        doc = patch_body
+                        logger.info(f"[WS] Answer saved in MongoDB: Round {round_num} Q#{question_id} conv_key={conv_key} pair_idx={pair_idx}")
                     else:
-                        put_body = doc
+                        # MongoDB unavailable — update in-memory doc so flow continues
+                        logger.warning(f"[WS] ir_patch failed ({patch_status}), updating in-memory doc only")
+                        doc = json.loads(json.dumps(doc))   # deep copy
+                        _cats = doc.get("categories") or {}
+                        _cat = _cats.get(cat_key) or {}
+                        _conv_sets = _cat.get("conversationSets") or {}
+                        if conv_key in _conv_sets and isinstance(_conv_sets[conv_key], list) and pair_idx < len(_conv_sets[conv_key]):
+                            _conv_sets[conv_key][pair_idx]["answer"] = answer
 
-                    if _in_memory:
-                        # Update in-memory doc with the answered categories
-                        doc = dict(doc, categories=categories)
-                        cache_key_mem = f"{pid}_{cid}_{qset_id}_{session.get('assessment_summary_id', '')}"
-                        mem_cache = session.get("mem_screening_cache") or {}
-                        mem_cache[cache_key_mem] = doc
-                        session["mem_screening_cache"] = mem_cache
-                        logger.info(f"[WS] Answer saved in-memory (MongoDB unavailable): Round {round_num} Q#{question_id}")
-                    
-                    # 4) Fresh doc for next question
-                    if not _in_memory and screening_id:
-                        get_status, fresh_doc = await candidate_get_interview(cand_url, cid, pid, qset_id)
-                        if get_status == 200:
-                            doc = fresh_doc
-                        else:
-                            doc = put_body if isinstance(put_body, dict) else doc
-                    # (in-memory doc already updated above)
-                    
+                    ir_cache[ir_cache_key] = doc
+                    session["ir_cache"] = ir_cache
+
+                    # 4) Determine next question index from updated doc
                     flat = build_flat_qa_list(doc, round_num)
                     next_idx = flat_index + 1
                     next_q_text = ""
                     all_done = next_idx >= len(flat)
-                    _resp_next_at, _resp_next_pt = 120, 5  # defaults for next question timing
-                    _timing_set_by_cross = False  # flag: cross-question block already assigned timing
-                    
-                    # 4) Optional: generate cross-question (if conversational and under per-main-question limit)
-                    # NOTE: Do NOT gate on `not all_done` — the last main question also needs cross-questions.
-                    # Cross-question generation sets all_done = False when a new question is appended.
+                    _resp_next_at, _resp_next_pt = 120, 5
+                    _timing_set_by_cross = False
+
+                    # 5) Cross-question generation (conversational mode, under per-main-Q limit)
                     conv_key_for_cross = conv_key
                     cross_count = min(4, max(1, int(cross_general if round_num == 1 else cross_position)))
-                    if is_conversational and conv_key_for_cross and screening_id:
+                    if is_conversational and conv_key_for_cross:
                         followups = followup_count_for_conv_key(doc, round_num, conv_key_for_cross)
-                        logger.info(f"[WS CROSS-Q] Attempting: followups={followups}/{cross_count}, conv_key={conv_key_for_cross}")
+                        logger.info(f"[WS CROSS-Q] followups={followups}/{cross_count} conv_key={conv_key_for_cross}")
                         if followups < cross_count:
                             flat_cross = build_flat_qa_list(doc, round_num)
                             current_q = flat_cross[flat_index][2] if flat_index < len(flat_cross) else ""
@@ -1772,36 +1905,47 @@ async def websocket_test_session(websocket: WebSocket):
                             try:
                                 new_q = await generate_cross_question(current_q or "", answer or "", history_list, tenant_id=session.get("tenant_id", ""))
                                 if new_q:
-                                    logger.info(f"[WS CROSS-Q] Generated: '{new_q[:100]}...'")
-                                    categories_cross = json.loads(json.dumps((doc or {}).get("categories") or {}))
-                                    cat_c = categories_cross.get(cat_key) or {}
-                                    conv_c = cat_c.get("conversationSets") or {}
-                                    if conv_key_for_cross in conv_c and isinstance(conv_c[conv_key_for_cross], list):
-                                        # Inherit timing from parent question (same conv_key)
-                                        _san_t_list = session.get(f"q_timing_{qset_id}_{round_num}") or []
-                                        _san_ci = sort_conv_key(conv_key_for_cross) - 1
-                                        _san_at, _san_pt = _san_t_list[_san_ci] if 0 <= _san_ci < len(_san_t_list) else (120, 5)
-                                        conv_c[conv_key_for_cross].append({"question": new_q, "answer": "", "answerTime": _san_at, "prepareTime": _san_pt})
-                                        r_c_status, _ = await candidate_put_interview(cand_url, screening_id, {"categories": categories_cross})
-                                        if 200 <= r_c_status < 300:
-                                            next_idx = flat_index + 1
-                                            next_q_text = new_q
-                                            all_done = False
-                                            _resp_next_at = _san_at
-                                            _resp_next_pt = _san_pt
-                                            _timing_set_by_cross = True
-                                            logger.info(f"[WS CROSS-Q] Inserted at index {next_idx}")
-                                        else:
-                                            logger.warning(f"[WS CROSS-Q] PUT failed: {r_c_status}")
+                                    _san_t_list = session.get(f"q_timing_{qset_id}_{round_num}") or []
+                                    _san_ci = sort_conv_key(conv_key_for_cross) - 1
+                                    _san_at, _san_pt = _san_t_list[_san_ci] if 0 <= _san_ci < len(_san_t_list) else (120, 5)
+                                    # Append cross-question pair to MongoDB
+                                    cq_status, cq_body = await ir_patch(cand_url, {
+                                        "candidateId": cid, "positionId": pid,
+                                        "round": round_num, "convKey": conv_key_for_cross,
+                                        "appendQuestion": new_q,
+                                        "appendAnswerTime": _san_at, "appendPrepareTime": _san_pt,
+                                    }, tenant_id=tenant_id)
+                                    if 200 <= cq_status < 300 and cq_body:
+                                        doc = cq_body
+                                    else:
+                                        # In-memory fallback
+                                        doc = json.loads(json.dumps(doc))
+                                        _cats_c = doc.get("categories") or {}
+                                        _cat_c = _cats_c.get(cat_key) or {}
+                                        _conv_c = _cat_c.get("conversationSets") or {}
+                                        if conv_key_for_cross in _conv_c and isinstance(_conv_c[conv_key_for_cross], list):
+                                            _conv_c[conv_key_for_cross].append({"question": new_q, "answer": "", "answerTime": _san_at, "prepareTime": _san_pt})
+                                    ir_cache[ir_cache_key] = doc
+                                    session["ir_cache"] = ir_cache
+                                    # Rebuild flat list to include the new cross-question
+                                    flat = build_flat_qa_list(doc, round_num)
+                                    if flat_index + 1 < len(flat):
+                                        next_idx = flat_index + 1
+                                        next_q_text = flat[next_idx][2] or new_q
+                                        all_done = False
+                                        _resp_next_at = _san_at
+                                        _resp_next_pt = _san_pt
+                                        _timing_set_by_cross = True
+                                        logger.info(f"[WS CROSS-Q] Generated and persisted: '{new_q[:80]}'")
                                 else:
                                     logger.warning("[WS CROSS-Q] generate_cross_question returned empty")
-                            except Exception as e:
-                                logger.warning("[WS CROSS-Q] Failed: %s", e)
-                    
+                            except Exception as _cq_err:
+                                logger.warning("[WS CROSS-Q] Failed: %s", _cq_err)
+
                     if not next_q_text and next_idx < len(flat):
                         next_q_text = flat[next_idx][2] or ""
 
-                    # Compute timing for next question only if not already set by cross-question block
+                    # Compute timing for next question (if not set by cross-question block)
                     if not _timing_set_by_cross and not all_done and next_idx < len(flat):
                         try:
                             _rn_ck = flat[next_idx][0]

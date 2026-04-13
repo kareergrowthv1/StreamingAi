@@ -6,7 +6,9 @@ import logging
 import os
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Body, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 import config
@@ -20,10 +22,13 @@ router = APIRouter(prefix="/ai", tags=["JD Generator"])
 
 class JDGeneratorRequest(BaseModel):
     position: str = Field(..., description="Job title / position")
+    domain: str = Field(default="", description="Job Domain or Role")
     minExperience: int = Field(..., description="Minimum years of experience")
     maxExperience: int = Field(..., description="Maximum years of experience")
     manSkills: List[str] = Field(..., description="Mandatory skills")
     optSkills: List[str] = Field(default_factory=list, description="Optional skills")
+    jobType: str = Field(default="", description="e.g. Full-time, Contract")
+    location: str = Field(default="", description="Job location")
 
 
 def _get_openai_client(cfg: dict):
@@ -173,3 +178,107 @@ Qualified candidates with the required experience and skills are encouraged to a
             optional,
         )
         return {"jobDescription": result}
+
+
+@router.websocket("/ws/generate-job-description")
+async def websocket_generate_job_description(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_text()
+        try:
+            req_data = json.loads(data)
+            request = JDGeneratorRequest(**req_data)
+        except Exception as e:
+            await websocket.send_text(f"Invalid request format: {e}")
+            await websocket.close(code=1003)
+            return
+
+        mandatory = request.manSkills or []
+        optional = request.optSkills or []
+        man_text = ", ".join(mandatory)
+        opt_text = ", ".join(optional)
+
+        system_prompt = """
+You are a professional technical recruiter specializing in creating job descriptions.
+Generate a job description based on the provided position, experience level, and skills.
+
+The job description MUST follow this EXACT format with all sections:
+
+job title: [Position Title] ([Experience Range] years of experience)
+
+Company: [Company-name]
+[Company-name] is a leading tech company specializing in innovative software solutions for a wide range of industries. We are committed to pushing the boundaries of technology to deliver cutting-edge products to our clients.
+
+Location: [Location]
+
+Job Type: [Job Type]
+
+Position Overview:
+[Write a concise overview paragraph tailored to the position and skills. Mention the mandatory skills.]
+
+Key Responsibilities:
+[5 responsibilities specific to the position and skills, each on a new line without bullets]
+
+Required Qualifications
+[Experience range] years of experience in [relevant field]
+Proficiency in [list all mandatory skills]
+[One more relevant qualification]
+
+Preferred Qualifications
+Experience with [list all optional skills]
+Bachelor's degree in [relevant field] or related field
+
+Qualified candidates with the required experience and skills are encouraged to apply and be part of our innovative team at [Company-name]
+"""
+
+        user_prompt = (
+            f"Create a job description for a {request.position} position (Domain/Role: {request.domain}).\n"
+            f"Experience Required: {request.minExperience} to {request.maxExperience} years.\n"
+            f"Job Type: {request.jobType or '[--]'}\n"
+            f"Location: {request.location or '[--]'}\n"
+            f"Mandatory Skills: {man_text}\n"
+            f"Optional Skills: {opt_text}\n\n"
+            f"Important instructions:\n"
+            f"1. Replace [Position Title] with '{request.position}'.\n"
+            f"2. Replace [Experience Range] with '{request.minExperience}-{request.maxExperience}'.\n"
+            f"3. Replace [Location] with '{request.location or '[--]'}'.\n"
+            f"4. Replace [Job Type] with '{request.jobType or '[--]'}'.\n"
+            f"5. DO NOT replace placeholders like [Company-name].\n"
+            f"6. Write content specific to the {request.position} role and the listed skills.\n"
+            f"7. Key responsibilities: 5 items without bullet points.\n"
+            f"8. Return only the formatted job description template.\n"
+        )
+
+        cfg = await get_ai_config()
+        client = _get_openai_client(cfg)
+        model = cfg.get("model", "gpt-3.5-turbo")
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.7,
+            max_tokens=1500,
+            stream=True
+        )
+
+        import asyncio
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                await websocket.send_text(chunk.choices[0].delta.content)
+                await asyncio.sleep(0.01) # Small delay for smoother visual streaming
+
+        await websocket.send_text("[DONE]")
+        await websocket.close(code=1000)
+
+    except WebSocketDisconnect:
+        logger.info("JD Streaming WebSocket disconnected")
+    except Exception as e:
+        logger.exception("JD generation websocket failed: %s", e)
+        try:
+            await websocket.send_text(f"\n[Error: {str(e)}]")
+            await websocket.close(code=1011)
+        except:
+            pass

@@ -32,6 +32,34 @@ def _internal_headers() -> dict:
     return h
 
 
+def _auth_headers() -> dict:
+    """Optional bearer auth header for admin routes that require JWT/session auth."""
+    bearer = (
+        getattr(_config, "ADMIN_BEARER_TOKEN", "")
+        or getattr(_config, "ADMIN_AUTH_TOKEN", "")
+        if _config else ""
+    )
+    return {"Authorization": f"Bearer {bearer}"} if bearer else {}
+
+
+def _candidate_admin_bases(admin_url: str) -> list[str]:
+    """Return base URL candidates (normalized) for different route mount styles."""
+    base = admin_url.rstrip("/")
+    bases = [base]
+    if base.endswith("/admins"):
+        bases.append(base[:-7])
+    if base.endswith("/api"):
+        bases.append(base[:-4])
+    # Preserve order but dedupe.
+    out = []
+    seen = set()
+    for b in bases:
+        if b and b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
+
+
 async def get_assessment_summaries(
     admin_url: str,
     candidate_id: str,
@@ -85,22 +113,79 @@ async def get_question_sections(
     question_set_id: str,
     tenant_id: Optional[str] = None,
 ) -> tuple[int, Any]:
-    """GET /admins/question-sections/question-set/{question_set_id} . Returns (status_code, body)."""
-    url = f"{admin_url.rstrip('/')}/admins/question-sections/question-set/{question_set_id}"
-    headers = {}
+    """Fetch question-sections from AdminBackend across route variants.
+
+    Order:
+    1) /internal/question-sections/... with X-Service-Token (preferred)
+    2) /api/question-sections/... (older stacks)
+    3) /admins/question-sections/... (legacy proxy route)
+    """
+    bases = _candidate_admin_bases(admin_url)
+    paths = [
+        f"/internal/question-sections/question-set/{question_set_id}",
+        f"/api/question-sections/question-set/{question_set_id}",
+        f"/admins/question-sections/question-set/{question_set_id}",
+    ]
+    last_status = 0
+    last_body: Any = {"error": "No response"}
+
+    for base in bases:
+        for path in paths:
+            url = f"{base}{path}"
+            headers = _internal_headers() if path.startswith("/internal/") else _auth_headers()
+            if tenant_id:
+                headers["X-Tenant-Id"] = tenant_id
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {"raw": r.text}
+                if r.status_code == 200:
+                    return 200, body
+                last_status, last_body = r.status_code, body
+                logger.info("get_question_sections fallback: %s -> %s", url, r.status_code)
+            except Exception as e:
+                last_status, last_body = 0, {"error": str(e)}
+                logger.info("get_question_sections fallback exception for %s: %s", url, e)
+
+    logger.warning("get_question_sections failed after all fallbacks: status=%s body=%s", last_status, last_body)
+    return last_status, last_body
+
+
+async def get_cross_question_settings(
+    admin_url: str,
+    client_id: str,
+    tenant_id: Optional[str] = None,
+) -> dict:
+    """Fetch cross-question count settings from AdminBackend internal API.
+
+    Returns dict with crossQuestionCountGeneral and crossQuestionCountPosition (defaults: 2).
+    Always returns a usable dict — never raises.
+    """
+    url = f"{admin_url.rstrip('/')}/internal/cross-question-settings"
+    headers = _internal_headers()
     if tenant_id:
         headers["X-Tenant-Id"] = tenant_id
+    params = {"clientId": client_id}
+    _default = {"crossQuestionCountGeneral": 2, "crossQuestionCountPosition": 2}
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+            r = await client.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT)
+        body = {}
         try:
             body = r.json()
         except Exception:
-            body = {"raw": r.text}
-        return r.status_code, body
+            pass
+        data = body.get("data") or {}
+        return {
+            "crossQuestionCountGeneral": max(1, min(4, int(data.get("crossQuestionCountGeneral") or 2))),
+            "crossQuestionCountPosition": max(1, min(4, int(data.get("crossQuestionCountPosition") or 2))),
+        }
     except Exception as e:
-        logger.warning("get_question_sections failed: %s", e)
-        return 0, {"error": str(e)}
+        logger.warning("get_cross_question_settings failed: %s", e)
+        return _default
 
 
 async def put_update_interview_status(

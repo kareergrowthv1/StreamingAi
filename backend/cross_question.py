@@ -50,8 +50,8 @@ async def generate_cross_question(
             "Do NOT repeat or paraphrase any question from: " + history_str + ".\n\n"
         )
         prompt = (
-            base
-            + f"Current Question: {current_question}\nCandidate's Answer: {answer_text}\n\n"
+            base +
+            f"Current Question: {current_question}\nCandidate's Answer: {answer_text}\n\n" +
             "Return ONLY the follow-up question text. No prefixes, no labels."
         )
         response = await client.chat.completions.create(

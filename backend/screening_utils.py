@@ -3,6 +3,37 @@ Screening document and round-question helpers for Round 1 & 2.
 Used by main.py for building categories, flat Q&A lists, and next-unanswered logic.
 """
 
+import re
+
+
+def parse_seconds(value, fallback: int) -> int:
+    """Parse numeric/string durations into seconds (e.g., '10 secs', '2 mins', '01:30')."""
+    if value is None:
+        return fallback
+    if isinstance(value, (int, float)):
+        return int(value)
+    raw = str(value).strip().lower()
+    if not raw:
+        return fallback
+    if raw.isdigit():
+        return int(raw)
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)$", raw)
+    if m:
+        amount = float(m.group(1))
+        unit = m.group(2)
+        if unit.startswith("h"):
+            return int(round(amount * 3600))
+        if unit.startswith("m"):
+            return int(round(amount * 60))
+        return int(round(amount))
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", raw):
+        parts = [int(x) for x in raw.split(":")]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return fallback
+
 
 def sort_conv_key(k) -> int:
     """Sort key for conversationQuestion1, conversationQuestion2, ..."""
@@ -85,10 +116,10 @@ def questions_for_round(data: dict, round_number: int) -> list:
     if not data:
         return []
     if round_number == 1:
-        gq = data.get("generalQuestions") or {}
+        gq = data.get("generalQuestions") or data.get("generalQuestion") or {}
         return gq.get("questions") if isinstance(gq, dict) else []
     if round_number == 2:
-        pq = data.get("positionSpecificQuestions") or {}
+        pq = data.get("positionSpecificQuestions") or data.get("positionSpecificQuestion") or {}
         return pq.get("questions") if isinstance(pq, dict) else []
     if round_number == 3:
         cq = data.get("codingQuestions")
@@ -111,7 +142,13 @@ def build_screening_categories_from_sections(data: dict) -> dict:
     g_sets = {}
     for i, q in enumerate(g_questions or []):
         key = f"conversationQuestion{i + 1}"
-        g_sets[key] = [{"question": q.get("question", ""), "answer": "", "answerTime": int(q.get("answerTime", 120)), "prepareTime": int(q.get("prepareTime", 5))}]
+        qd = q if isinstance(q, dict) else {}
+        g_sets[key] = [{
+            "question": qd.get("question", ""),
+            "answer": "",
+            "answerTime": parse_seconds(qd.get("answerTime", qd.get("timeToAnswer")), 120),
+            "prepareTime": parse_seconds(qd.get("prepareTime", qd.get("timeToPrepare")), 10),
+        }]
     if g_sets:
         categories["generalQuestion"] = {"conversationSets": g_sets}
     # positionSpecificQuestion
@@ -120,7 +157,13 @@ def build_screening_categories_from_sections(data: dict) -> dict:
     p_sets = {}
     for i, q in enumerate(p_questions or []):
         key = f"conversationQuestion{i + 1}"
-        p_sets[key] = [{"question": q.get("question", ""), "answer": "", "answerTime": int(q.get("answerTime", 120)), "prepareTime": int(q.get("prepareTime", 5))}]
+        qd = q if isinstance(q, dict) else {}
+        p_sets[key] = [{
+            "question": qd.get("question", ""),
+            "answer": "",
+            "answerTime": parse_seconds(qd.get("answerTime", qd.get("timeToAnswer")), 120),
+            "prepareTime": parse_seconds(qd.get("prepareTime", qd.get("timeToPrepare")), 10),
+        }]
     if p_sets:
         categories["positionSpecificQuestion"] = {"conversationSets": p_sets}
     return categories

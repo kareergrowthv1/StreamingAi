@@ -11,8 +11,10 @@ PORT = int(os.getenv("PORT", "9000"))
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")).resolve()
 CHUNKS_DIR = Path(os.getenv("CHUNKS_DIR", "./chunks")).resolve()
 MERGED_DIR = Path(os.getenv("MERGED_DIR", "./merged")).resolve()
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Mediapipe Model
+MODEL_PATH = Path(__file__).resolve().parent / "models" / "face_landmarker.task"
 
 # CORS: comma-separated origins.
 # Default covers all local frontend ports:

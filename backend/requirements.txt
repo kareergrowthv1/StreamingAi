@@ -40,4 +40,4 @@ motor>=3.3.0
 
 # --- Cloud storage (optional; uncomment if using) ---
 # boto3==1.35.93
-# google-cloud-storage==2.18.4
+google-cloud-storage==2.18.2

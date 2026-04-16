@@ -26,12 +26,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import config
 from ai_config_loader import get_ai_config_sync
+from gcs_upload import list_report_screenshot_urls
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/report", tags=["Report Generator"])
@@ -231,7 +232,7 @@ async def generate_report(req: GenerateReportRequest):
 
 
 @router.get("/get/{positionId}/{candidateId}")
-async def get_report(positionId: str, candidateId: str):
+async def get_report(positionId: str, candidateId: str, clientId: str = Query(default="")):
     """
     Get the existing generated report from MongoDB.
     Returns 404 if not generated yet.
@@ -239,9 +240,10 @@ async def get_report(positionId: str, candidateId: str):
     key = _queue_key(positionId, candidateId)
     in_queue_or_processing = (key in _in_progress or key in _queue_keys)
 
-    existing = await _get_existing_report(positionId, candidateId)
+    existing = await _get_existing_report(positionId, candidateId, clientId)
     if existing and existing.get("isGenerated"):
-        return JSONResponse(status_code=200, content=_build_completed_response(existing, is_existing=True))
+        enriched = await _inject_dynamic_screenshot_assets(existing, fallback_client_id=clientId)
+        return JSONResponse(status_code=200, content=_build_completed_response(enriched, is_existing=True))
 
     persisted_status = (existing or {}).get("generationStatus")
     if persisted_status in {"queued", "in_progress"}:
@@ -261,7 +263,7 @@ async def get_report(positionId: str, candidateId: str):
     return JSONResponse(status_code=404, content={
         "success": False,
         "status": "not_found",
-        "message": "Report not yet generated. POST /report/generate to start.",
+        "message": "Report not found in MongoDB for the provided keys.",
     })
 
 
@@ -305,6 +307,26 @@ async def _process_report(item: dict):
 
     logger.info("[ReportGen] === STEP 2: Running AI analysis ===")
 
+    screenshot_assets = {
+        "profilePicture": "",
+        "calibration": [],
+        "noFace": [],
+        "multipleFaces": [],
+        "allDirection": [],
+        "all": [],
+    }
+    if client_id and position_id and candidate_id and config.GCS_BUCKET:
+        try:
+            screenshot_assets = await asyncio.to_thread(
+                list_report_screenshot_urls,
+                client_id,
+                position_id,
+                candidate_id,
+                4,
+            )
+        except Exception as ss_err:
+            logger.warning("[ReportGen] screenshot discovery failed: %s", ss_err)
+
     # Determine domain & round weights
     round_marks = _calc_round_marks(position_details, assessment_summary)
 
@@ -337,6 +359,7 @@ async def _process_report(item: dict):
         r1r2_data=r1r2_data,
         r3_data=r3_data,
         r4_data=r4_data,
+        screenshot_assets=screenshot_assets,
     )
 
     await _save_report(position_id, candidate_id, report_doc)
@@ -445,7 +468,7 @@ async def _fetch_aptitude_data(client: httpx.AsyncClient, cand_url: str,
 def _calc_round_marks(position_details: dict, assessment_summary: dict) -> dict:
     """
     Calculate max marks per round based on domain type and which rounds are assigned.
-    TECH:     General(10) + Position(40) + Aptitude(10) + Coding(40) = 100
+    TECH:     General(10) + Position(40) + Coding(40) + Aptitude(10) = 100
     NON_TECH: General(50) + Position(40) + Aptitude(10) = 100  (or 50+50 if no aptitude)
     """
     domain = (position_details.get("domainType") or "TECH").upper()
@@ -463,19 +486,19 @@ def _calc_round_marks(position_details: dict, assessment_summary: dict) -> dict:
 
     if domain == "TECH":
         if r1a: marks["general"] = 10
-        if r3a: marks["aptitude"] = 10
-        if r2a and r4a:
+        if r4a: marks["aptitude"] = 10
+        if r2a and r3a:
             marks["position"] = 40; marks["coding"] = 40
-        elif r2a and not r4a:
+        elif r2a and not r3a:
             marks["position"] = 90 - marks["aptitude"]
-        elif r4a and not r2a:
+        elif r3a and not r2a:
             marks["coding"] = 90 - marks["aptitude"]
-        elif r2a and r4a and not r3a:
+        elif r2a and r3a and not r4a:
             marks["position"] = 45; marks["coding"] = 45
     else:
         if r1a: marks["general"] = 50
-        if r3a: marks["aptitude"] = 10
-        if r2a and r3a:
+        if r4a: marks["aptitude"] = 10
+        if r2a and r4a:
             marks["position"] = 40
         elif r2a:
             marks["position"] = 50
@@ -992,6 +1015,11 @@ async def _run_full_analysis(
     else:
         recommendation = "NOT_RECOMMENDED"
 
+    logger.info(
+        "[ReportGen] AI Recommendation determined: %s (overall_pct=%s, candidate=%s, position=%s)",
+        recommendation, overall_pct, candidate_id[:8], position_id[:8]
+    )
+
     # Soft skills from general analysis
     soft_skills = {
         "fluency": general_analysis.get("fluency") or 0,
@@ -1142,6 +1170,7 @@ def _build_report_doc(
     position_details: dict, jd_text: str, resume_text: str,
     assessment_summary: dict, round_marks: dict, analysis: dict,
     r1r2_data: dict, r3_data: dict, r4_data: list,
+    screenshot_assets: dict | None = None,
 ) -> dict:
     scores = analysis.get("scores", {})
     general_round = analysis.get("generalAnalysis", {})
@@ -1179,7 +1208,7 @@ def _build_report_doc(
     # Build conclusion - must never be empty
     conclusion_text = overall_summary.get("finalRecommendation") or ""
     if not conclusion_text:
-        rec = scores.get("recommendation", "NOT_RECOMMENDED")
+        rec = scores.get("recommendationStatus") or scores.get("recommendation", "NOT_RECOMMENDED")
         overall_pct_val = scores.get("overallPercentage", 0)
         conclusion_text = f"{rec.replace('_', ' ')} — Overall score: {overall_pct_val}%."
     conclusion = [conclusion_text]
@@ -1241,6 +1270,13 @@ def _build_report_doc(
             "isCorrect": bool(q.get("correctAnswer")) and (str(q.get("answerText") or q.get("answer") or "").strip() == str(q.get("correctAnswer") or "").strip()),
         })
 
+    screenshot_assets = screenshot_assets or {}
+    profile_picture = (
+        candidate_profile.get("profilePicture")
+        or screenshot_assets.get("profilePicture")
+        or ""
+    )
+
     unified_report = {
         "positionId": position_id,
         "candidateId": candidate_id,
@@ -1248,6 +1284,7 @@ def _build_report_doc(
         "candidateName": candidate_profile.get("candidateName"),
         "email": candidate_profile.get("email"),
         "phone": candidate_profile.get("phone"),
+        "profilePicture": profile_picture,
         "companyName": candidate_profile.get("companyName"),
         "positionName": candidate_profile.get("positionName") or position_details.get("title"),
         "jobTitle": position_details.get("title"),
@@ -1259,7 +1296,7 @@ def _build_report_doc(
         "questionSetDuration": candidate_profile.get("questionSetDuration"),
         "interviewDate": candidate_profile.get("interviewDate") or assessment_summary.get("assessmentStartTime"),
         "interviewDuration": assessment_summary.get("assessmentTimeTaken") or "",
-        "recommendationStatus": scores.get("recommendation", "NOT_RECOMMENDED"),
+        "recommendationStatus": scores.get("recommendationStatus") or scores.get("recommendation", "NOT_RECOMMENDED"),
         "resumeSummary": "\n".join(f"• {p}" for p in resume_summary_points) if resume_summary_points else (resume_text[:1500] if resume_text else ""),
         "resumeSummaryPoints": resume_summary_points,
         "resumeScore": candidate_profile.get("resumeScore"),
@@ -1269,10 +1306,10 @@ def _build_report_doc(
         "status": True,
         "generalScreeningScore": scores.get("generalMarks", 0),
         "generalScreeningStatus": bool(round_marks.get("general", 0)),
-        "aptitudeScreeningScore": scores.get("aptitudeMarks", 0),
-        "aptitudeScreeningStatus": bool(round_marks.get("aptitude", 0)),
         "codingScreeningScore": scores.get("codingMarks", 0),
         "codingScreeningStatus": bool(round_marks.get("coding", 0)),
+        "aptitudeScreeningScore": scores.get("aptitudeMarks", 0),
+        "aptitudeScreeningStatus": bool(round_marks.get("aptitude", 0)),
         "positionSpecificScreeningScore": scores.get("positionMarks", 0),
         "positionSpecificScreeningStatus": bool(round_marks.get("position", 0)),
         "aiGeneratedPercentage": 40,
@@ -1386,18 +1423,18 @@ def _build_report_doc(
                 "assigned": bool(round_marks.get("position", 0)),
             },
             {
-                "round": "Aptitude Assessment",
+                "round": "Coding Challenge",
                 "roundKey": "round3",
                 "assignedTime": assessment_summary.get("round3GivenTime"),
                 "timeTaken": assessment_summary.get("round3TimeTaken"),
-                "assigned": bool(round_marks.get("aptitude", 0)),
+                "assigned": bool(round_marks.get("coding", 0)),
             },
             {
-                "round": "Coding Challenge",
+                "round": "Aptitude Assessment",
                 "roundKey": "round4",
                 "assignedTime": assessment_summary.get("round4GivenTime"),
                 "timeTaken": assessment_summary.get("round4TimeTaken"),
-                "assigned": bool(round_marks.get("coding", 0)),
+                "assigned": bool(round_marks.get("aptitude", 0)),
             },
         ],
         "screeningQuestions": screening_questions,
@@ -1406,6 +1443,13 @@ def _build_report_doc(
             "questions": aptitude_questions,
             "overallAiReview": aptitude_round.get("overallReview") or "",
         },
+        "proctoringScreenshots": {
+            "calibration": screenshot_assets.get("calibration") or [],
+            "noFace": screenshot_assets.get("noFace") or [],
+            "multipleFaces": screenshot_assets.get("multipleFaces") or [],
+            "allDirection": screenshot_assets.get("allDirection") or [],
+        },
+        "screenshots": screenshot_assets.get("all") or [],
     }
 
     return {
@@ -1434,7 +1478,7 @@ def _build_report_doc(
         "roundMarks": round_marks,
         "scores": scores,
         "overallPercentage": scores.get("overallPercentage", 0),
-        "recommendation": scores.get("recommendation", "NOT_RECOMMENDED"),
+        "recommendation": scores.get("recommendationStatus") or scores.get("recommendation", "NOT_RECOMMENDED"),
         "generalRound": analysis.get("generalAnalysis", {}),
         "positionRound": analysis.get("positionAnalysis", {}),
         "codingRound": analysis.get("codingAnalysis", {}),
@@ -1451,13 +1495,64 @@ def _build_report_doc(
     }
 
 
+async def _inject_dynamic_screenshot_assets(report_doc: dict, fallback_client_id: str = "") -> dict:
+    """Fetch latest screenshot URLs from GCS and merge into report response payload."""
+    if not isinstance(report_doc, dict):
+        return report_doc
+
+    client_id = str(report_doc.get("clientId") or fallback_client_id or "").strip()
+    position_id = str(report_doc.get("positionId") or "").strip()
+    candidate_id = str(report_doc.get("candidateId") or "").strip()
+
+    if not (client_id and position_id and candidate_id and config.GCS_BUCKET):
+        return report_doc
+
+    try:
+        assets = await asyncio.to_thread(
+            list_report_screenshot_urls,
+            client_id,
+            position_id,
+            candidate_id,
+            4,
+        )
+    except Exception as e:
+        logger.warning("[ReportGen] dynamic screenshot enrichment failed: %s", e)
+        return report_doc
+
+    if not isinstance(assets, dict):
+        return report_doc
+
+    updated = dict(report_doc)
+    unified = dict((updated.get("unifiedReport") or {}) if isinstance(updated.get("unifiedReport"), dict) else {})
+    if not unified:
+        unified = dict(updated)
+
+    if assets.get("profilePicture"):
+        unified["profilePicture"] = assets.get("profilePicture")
+
+    unified["proctoringScreenshots"] = {
+        "calibration": assets.get("calibration") or [],
+        "noFace": assets.get("noFace") or [],
+        "multipleFaces": assets.get("multipleFaces") or [],
+        "allDirection": assets.get("allDirection") or [],
+    }
+    unified["screenshots"] = assets.get("all") or []
+
+    updated["unifiedReport"] = unified
+    return updated
+
+
 def _build_completed_response(report_doc: dict, is_existing: bool) -> dict:
     unified = (report_doc or {}).get("unifiedReport") or (report_doc or {})
+    summary = (report_doc or {}).get("assessmentSummary")
+    if summary is None:
+        summary = unified.get("assessmentSummary") if isinstance(unified, dict) else {}
     data = {
         "requestId": f"{(report_doc or {}).get('positionId', '')}_{(report_doc or {}).get('candidateId', '')}",
         "status": "completed",
         "isExisting": bool(is_existing),
         **unified,
+        "assessmentSummary": summary or {},
     }
     return {
         "success": True,
@@ -1526,17 +1621,113 @@ async def _set_generation_state(
         logger.warning("[ReportGen] Failed to persist generation status (%s): %s", status, e)
 
 
-async def _get_existing_report(position_id: str, candidate_id: str) -> Optional[dict]:
-    """Fetch existing report from MongoDB."""
+async def _get_existing_report(position_id: str, candidate_id: str, client_id: str = "") -> Optional[dict]:
+    """Fetch existing report from MongoDB by position+candidate, optionally scoped by client."""
     col = _mongo_collection()
     if col is None:
         return None
     try:
-        doc = await col.find_one(
-            {"positionId": position_id, "candidateId": candidate_id},
-            {"_id": 0},
-        )
-        return doc
+        # 1) Exact match first.
+        exact_query = {
+            "positionId": position_id,
+            "candidateId": candidate_id,
+        }
+        if client_id:
+            exact_query["clientId"] = client_id
+
+        doc = await col.find_one(exact_query, {"_id": 0})
+        if doc:
+            return doc
+
+        # If client-scoped lookup misses, fall back to position+candidate only.
+        # This handles legacy rows where clientId was populated differently.
+        if client_id:
+            doc = await col.find_one(
+                {
+                    "positionId": position_id,
+                    "candidateId": candidate_id,
+                },
+                {"_id": 0},
+            )
+            if doc:
+                return doc
+
+        # 2) Tolerate dashed/non-dashed UUID drift across services.
+        normalized_position_id = (position_id or "").replace("-", "")
+        normalized_candidate_id = (candidate_id or "").replace("-", "")
+
+        normalized_query = {
+            "$expr": {
+                "$and": [
+                    {
+                        "$eq": [
+                            {"$replaceAll": {"input": "$positionId", "find": "-", "replacement": ""}},
+                            normalized_position_id,
+                        ]
+                    },
+                    {
+                        "$eq": [
+                            {"$replaceAll": {"input": "$candidateId", "find": "-", "replacement": ""}},
+                            normalized_candidate_id,
+                        ]
+                    },
+                ]
+            }
+        }
+        if client_id:
+            normalized_query["$or"] = [
+                {"clientId": client_id},
+                {"clientId": {"$exists": False}},
+                {"clientId": ""},
+            ]
+
+        doc = await col.find_one(normalized_query, {"_id": 0})
+        if doc:
+            return doc
+
+        # Retry normalized lookup without client filter for legacy/clientId drift.
+        if client_id:
+            doc = await col.find_one(
+                {
+                    "$expr": {
+                        "$and": [
+                            {
+                                "$eq": [
+                                    {"$replaceAll": {"input": "$positionId", "find": "-", "replacement": ""}},
+                                    normalized_position_id,
+                                ]
+                            },
+                            {
+                                "$eq": [
+                                    {"$replaceAll": {"input": "$candidateId", "find": "-", "replacement": ""}},
+                                    normalized_candidate_id,
+                                ]
+                            },
+                        ]
+                    }
+                },
+                {"_id": 0},
+            )
+            if doc:
+                return doc
+
+        # 3) Legacy fallback: documents created before clientId population.
+        if client_id:
+            doc = await col.find_one(
+                {
+                    "positionId": position_id,
+                    "candidateId": candidate_id,
+                    "$or": [
+                        {"clientId": {"$exists": False}},
+                        {"clientId": ""},
+                    ],
+                },
+                {"_id": 0},
+            )
+            if doc:
+                return doc
+
+        return None
     except Exception as e:
         logger.warning("[ReportGen] MongoDB fetch failed: %s", e)
         return None
@@ -1557,19 +1748,36 @@ async def _mark_report_generated(
             "positionScore": scores.get("positionScore"),
             "codingScore": scores.get("codingScore"),
             "aptitudeScore": scores.get("aptitudeScore"),
-            "recommendationStatus": scores.get("recommendation", "NOT_RECOMMENDED"),
+            "recommendationStatus": scores.get("recommendationStatus") or scores.get("recommendation", "NOT_RECOMMENDED"),
             "softSkillsFluency": scores.get("softSkillsFluency"),
             "softSkillsGrammar": scores.get("softSkillsGrammar"),
             "softSkillsConfidence": scores.get("softSkillsConfidence"),
             "softSkillsClarity": scores.get("softSkillsClarity"),
         },
     }
+    
+    recommendation_status = payload["scores"].get("recommendationStatus", "NOT_RECOMMENDED")
+    logger.info(
+        "[ReportGen] Sending mark-report-generated to AdminBackend: "
+        "recommendation=%s, totalScore=%s, tenantId=%s",
+        recommendation_status, payload["scores"].get("totalScore"), tenant_id
+    )
+    
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(f"{admin_url}/internal/mark-report-generated", json=payload, headers=headers)
             if resp.status_code == 200:
-                logger.info("[ReportGen] MySQL tables updated successfully")
+                logger.info(
+                    "[ReportGen] ✓ MySQL tables updated successfully (recommendation=%s for candidate=%s)",
+                    recommendation_status, candidate_id[:8]
+                )
             else:
-                logger.warning("[ReportGen] mark-report-generated returned %s", resp.status_code)
+                logger.warning(
+                    "[ReportGen] mark-report-generated returned %s (recommendation=%s, candidate=%s)",
+                    resp.status_code, recommendation_status, candidate_id[:8]
+                )
     except Exception as e:
-        logger.warning("[ReportGen] mark-report-generated call failed: %s", e)
+        logger.warning(
+            "[ReportGen] mark-report-generated call failed: %s (recommendation=%s, candidate=%s)",
+            e, recommendation_status, candidate_id[:8]
+        )

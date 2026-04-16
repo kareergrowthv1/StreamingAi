@@ -233,3 +233,36 @@ async def patch_complete_interview(
     except Exception as e:
         logger.warning("patch_complete_interview failed: %s", e)
         return 0, {"error": str(e)}
+
+
+async def patch_recording_link(
+    admin_url: str,
+    tenant_id: Optional[str],
+    position_id: str,
+    candidate_id: str,
+    recording_link: str,
+    recording_type: str = "screen",
+) -> tuple[int, Any]:
+    """PATCH /internal/recording-link — persists merged recording URL to tenant tables.
+    Returns (status_code, body).
+    """
+    url = f"{admin_url.rstrip('/')}/internal/recording-link"
+    payload = {
+        "positionId": position_id,
+        "candidateId": candidate_id,
+        "tenantId": tenant_id or "",
+        "recordingLink": (recording_link or "").strip(),
+        "recordingType": (recording_type or "screen").strip().lower(),
+    }
+    headers = _internal_headers()
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.patch(url, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        return r.status_code, body
+    except Exception as e:
+        logger.warning("patch_recording_link failed: %s", e)
+        return 0, {"error": str(e)}

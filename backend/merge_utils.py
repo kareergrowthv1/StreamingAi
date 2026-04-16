@@ -29,7 +29,7 @@ def do_merge_chunks(
     file_prefix   : glob prefix for chunk files (e.g. 'part_' or 'camera_part_')
     output_prefix : prefix for the final merged file (e.g. 'recording' or 'camera_recording')
     """
-    chunks_base = config.CHUNKS_DIR / client_id / position_id / candidate_id
+    chunks_base = config.local_chunks_dir(client_id, position_id, candidate_id)
     if not chunks_base.exists():
         return {"success": False, "error": f"Chunks directory not found: {chunks_base}"}
 
@@ -37,7 +37,7 @@ def do_merge_chunks(
     if not chunk_files:
         return {"success": False, "error": f"No chunk files found for prefix '{file_prefix}' in {chunks_base}"}
 
-    out_path = config.MERGED_DIR / client_id / position_id / candidate_id
+    out_path = config.local_merged_dir(client_id, position_id, candidate_id)
     out_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

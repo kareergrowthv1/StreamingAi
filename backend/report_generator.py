@@ -6,10 +6,10 @@ Single file for complete AI-driven assessment report generation.
 Features:
   - FIFO asyncio queue: only ONE report generates at a time.
   - Duplicate guard: if the same positionId+candidateId is already in queue/generating → return 202.
-  - Already-generated guard: if report exists in MongoDB and is_generated → return existing data.
+  - Already-generated guard: if report already exists in CandidateBackend storage → return existing data.
   - Fetches all data: position details, JD, resume, R1/R2 (conversational), R3 (coding), R4 (aptitude/MCQ).
   - Full AI analysis with LLM: communication, technical, coding review, aptitude, soft skills, overall.
-  - Saves to MongoDB collection `Candidates_Report` (one document per position+candidate).
+  - Persists report via CandidateBackend internal API (Streaming AI has no direct DB connection).
   - Updates MySQL: assessment_report_generation.is_generated = 1, interview_evaluations with scores.
 
 Endpoints:
@@ -38,54 +38,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/report", tags=["Report Generator"])
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MongoDB client (motor — async)
+# CandidateBackend persistence API (Streaming AI does not connect to DB directly)
 # ──────────────────────────────────────────────────────────────────────────────
-_mongo_client = None
-_mongo_db = None
-
-def _get_mongo_db():
-    global _mongo_client, _mongo_db
-    if _mongo_db is not None:
-        return _mongo_db
-    mongo_url = getattr(config, "MONGODB_URL", "") or ""
-    db_name = getattr(config, "MONGODB_DB_NAME", "kareergrowth") or "kareergrowth"
-    if not mongo_url:
-        logger.warning("[ReportGen] MONGODB_URL not set — MongoDB writes disabled")
-        return None
-    try:
-        from motor.motor_asyncio import AsyncIOMotorClient
-        _mongo_client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
-        _mongo_db = _mongo_client[db_name]
-        logger.info("[ReportGen] MongoDB connected (db=%s)", db_name)
-        return _mongo_db
-    except Exception as e:
-        logger.error("[ReportGen] MongoDB init failed: %s", e)
-        return None
+def _candidate_backend_url() -> str:
+    return (getattr(config, "CANDIDATE_BACKEND_URL", "") or "").rstrip("/")
 
 
-def _mongo_collection():
-    db = _get_mongo_db()
-    if db is None:
-        return None
-    return db["Candidates_Report"]
+def _candidate_internal_headers() -> dict:
+    token = (
+        getattr(config, "INTERNAL_SERVICE_TOKEN", "")
+        or getattr(config, "ADMIN_SERVICE_TOKEN", "")
+        or ""
+    ).strip()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Service-Token"] = token
+    return headers
 
 
 async def _ensure_report_index():
-    """Create a unique compound index on positionId+candidateId (idempotent — safe to call every startup)."""
-    col = _mongo_collection()
-    if col is None:
-        return
-    try:
-        from pymongo import ASCENDING
-        await col.create_index(
-            [("positionId", ASCENDING), ("candidateId", ASCENDING)],
-            unique=True,
-            background=True,
-            name="uq_position_candidate",
-        )
-        logger.info("[ReportGen] Unique index ensured on Candidates_Report(positionId, candidateId)")
-    except Exception as e:
-        logger.warning("[ReportGen] Index creation skipped (may already exist): %s", e)
+    """No-op in Streaming AI. Indexes are owned by CandidateBackend Mongo initialization."""
+    logger.info("[ReportGen] Report indexes are managed by CandidateBackend (no direct DB connection in Streaming AI)")
 
 # ──────────────────────────────────────────────────────────────────────────────
 _report_queue: asyncio.Queue = asyncio.Queue()
@@ -1562,20 +1535,29 @@ def _build_completed_response(report_doc: dict, is_existing: bool) -> dict:
 
 
 async def _save_report(position_id: str, candidate_id: str, doc: dict):
-    """Upsert report document into MongoDB Candidates_Report collection."""
-    col = _mongo_collection()
-    if col is None:
-        logger.warning("[ReportGen] MongoDB not available — skipping save")
+    """Upsert report document through CandidateBackend internal API."""
+    base = _candidate_backend_url()
+    if not base:
+        logger.warning("[ReportGen] CANDIDATE_BACKEND_URL not configured — cannot save report")
         return
+
+    payload = dict(doc or {})
+    payload["positionId"] = position_id
+    payload["candidateId"] = candidate_id
+
     try:
-        await col.update_one(
-            {"positionId": position_id, "candidateId": candidate_id},
-            {"$set": doc},
-            upsert=True,
-        )
-        logger.info("[ReportGen] Saved report to MongoDB Candidates_Report for %s/%s", position_id, candidate_id)
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{base}/internal/streaming/report-document",
+                headers=_candidate_internal_headers(),
+                json=payload,
+            )
+        if resp.status_code >= 300:
+            logger.warning("[ReportGen] CandidateBackend report save failed: %s %s", resp.status_code, resp.text[:300])
+        else:
+            logger.info("[ReportGen] Saved report via CandidateBackend for %s/%s", position_id, candidate_id)
     except Exception as e:
-        logger.error("[ReportGen] MongoDB save failed: %s", e)
+        logger.error("[ReportGen] CandidateBackend report save error: %s", e)
 
 
 async def _set_generation_state(
@@ -1586,9 +1568,12 @@ async def _set_generation_state(
     status: str,
     error_message: str = "",
 ):
-    """Persist generation status across worker/process instances."""
-    col = _mongo_collection()
-    if col is None or not position_id or not candidate_id:
+    """Persist generation status through CandidateBackend internal API."""
+    if not position_id or not candidate_id:
+        return
+
+    base = _candidate_backend_url()
+    if not base:
         return
 
     now = datetime.now(timezone.utc).isoformat()
@@ -1612,124 +1597,44 @@ async def _set_generation_state(
         payload["generationError"] = (error_message or "")[:1000]
 
     try:
-        await col.update_one(
-            {"positionId": position_id, "candidateId": candidate_id},
-            {"$set": payload, "$setOnInsert": {"createdAt": now}},
-            upsert=True,
-        )
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await client.patch(
+                f"{base}/internal/streaming/report-document",
+                headers=_candidate_internal_headers(),
+                json=payload,
+            )
     except Exception as e:
         logger.warning("[ReportGen] Failed to persist generation status (%s): %s", status, e)
 
 
 async def _get_existing_report(position_id: str, candidate_id: str, client_id: str = "") -> Optional[dict]:
-    """Fetch existing report from MongoDB by position+candidate, optionally scoped by client."""
-    col = _mongo_collection()
-    if col is None:
+    """Fetch existing report through CandidateBackend internal API."""
+    base = _candidate_backend_url()
+    if not base:
         return None
+
+    params = {
+        "positionId": position_id,
+        "candidateId": candidate_id,
+    }
+    if client_id:
+        params["clientId"] = client_id
+
     try:
-        # 1) Exact match first.
-        exact_query = {
-            "positionId": position_id,
-            "candidateId": candidate_id,
-        }
-        if client_id:
-            exact_query["clientId"] = client_id
-
-        doc = await col.find_one(exact_query, {"_id": 0})
-        if doc:
-            return doc
-
-        # If client-scoped lookup misses, fall back to position+candidate only.
-        # This handles legacy rows where clientId was populated differently.
-        if client_id:
-            doc = await col.find_one(
-                {
-                    "positionId": position_id,
-                    "candidateId": candidate_id,
-                },
-                {"_id": 0},
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{base}/internal/streaming/report-document",
+                headers=_candidate_internal_headers(),
+                params=params,
             )
-            if doc:
-                return doc
-
-        # 2) Tolerate dashed/non-dashed UUID drift across services.
-        normalized_position_id = (position_id or "").replace("-", "")
-        normalized_candidate_id = (candidate_id or "").replace("-", "")
-
-        normalized_query = {
-            "$expr": {
-                "$and": [
-                    {
-                        "$eq": [
-                            {"$replaceAll": {"input": "$positionId", "find": "-", "replacement": ""}},
-                            normalized_position_id,
-                        ]
-                    },
-                    {
-                        "$eq": [
-                            {"$replaceAll": {"input": "$candidateId", "find": "-", "replacement": ""}},
-                            normalized_candidate_id,
-                        ]
-                    },
-                ]
-            }
-        }
-        if client_id:
-            normalized_query["$or"] = [
-                {"clientId": client_id},
-                {"clientId": {"$exists": False}},
-                {"clientId": ""},
-            ]
-
-        doc = await col.find_one(normalized_query, {"_id": 0})
-        if doc:
-            return doc
-
-        # Retry normalized lookup without client filter for legacy/clientId drift.
-        if client_id:
-            doc = await col.find_one(
-                {
-                    "$expr": {
-                        "$and": [
-                            {
-                                "$eq": [
-                                    {"$replaceAll": {"input": "$positionId", "find": "-", "replacement": ""}},
-                                    normalized_position_id,
-                                ]
-                            },
-                            {
-                                "$eq": [
-                                    {"$replaceAll": {"input": "$candidateId", "find": "-", "replacement": ""}},
-                                    normalized_candidate_id,
-                                ]
-                            },
-                        ]
-                    }
-                },
-                {"_id": 0},
-            )
-            if doc:
-                return doc
-
-        # 3) Legacy fallback: documents created before clientId population.
-        if client_id:
-            doc = await col.find_one(
-                {
-                    "positionId": position_id,
-                    "candidateId": candidate_id,
-                    "$or": [
-                        {"clientId": {"$exists": False}},
-                        {"clientId": ""},
-                    ],
-                },
-                {"_id": 0},
-            )
-            if doc:
-                return doc
-
+        if resp.status_code == 200:
+            body = resp.json() or {}
+            return body.get("data") if isinstance(body, dict) else None
+        if resp.status_code != 404:
+            logger.warning("[ReportGen] CandidateBackend report fetch returned %s", resp.status_code)
         return None
     except Exception as e:
-        logger.warning("[ReportGen] MongoDB fetch failed: %s", e)
+        logger.warning("[ReportGen] CandidateBackend report fetch failed: %s", e)
         return None
 
 

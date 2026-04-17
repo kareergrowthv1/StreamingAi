@@ -5,7 +5,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+base_dir = Path(__file__).resolve().parent
+
+# Always load base env first.
+load_dotenv(dotenv_path=base_dir / ".env")
+
+# Load local overrides only in non-hosted, non-production runtime.
+is_hosted_runtime = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
+is_production = str(os.getenv("NODE_ENV", "")).lower() == "production"
+if not is_hosted_runtime and not is_production:
+    load_dotenv(dotenv_path=base_dir / ".env.local", override=True)
 
 
 def _build_ca_bundle_path() -> str:

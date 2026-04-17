@@ -3,7 +3,7 @@ Conversational Message API – AI Mock Interview endpoints.
 - POST /ai/generate-topics        → Generate 4 key focus concepts
 - POST /ai/mock/generate-questions → Generate interview questions (non-conv: all, conv: first Q)
 - POST /ai/mock/cross-question    → Generate 1 cross-question based on candidate's answer
-- POST /ai/mock/save-session      → Save completed session to MongoDB aimock collection
+- POST /ai/mock/save-session      → Save completed session via CandidateBackend API
 """
 import logging
 import os
@@ -278,56 +278,58 @@ class SaveSessionRequest(BaseModel):
 
 @router.post("/mock/save-session")
 async def save_session(request: SaveSessionRequest = Body(...)):
-    """Save the completed AI mock session to MongoDB aimock collection."""
-    try:
-        from motor.motor_asyncio import AsyncIOMotorClient
-    except ImportError:
-        try:
-            import pymongo
-            client = pymongo.MongoClient(config.MONGODB_URL)
-            db = client[config.MONGODB_DB_NAME]
-            collection = db["aimock"]
-            doc = {
-                "candidateId": request.candidateId,
-                "round": request.round,
-                "roundTitle": request.roundTitle,
-                "mode": request.mode,
-                "durationMinutes": request.durationMinutes,
-                "concepts": request.concepts,
-                "questions": [q.dict() if hasattr(q, "dict") else q.model_dump() for q in request.questions],
-                "status": request.status,
-                "startedAt": request.startedAt or datetime.now(timezone.utc).isoformat(),
-                "completedAt": request.completedAt or datetime.now(timezone.utc).isoformat(),
-                "savedAt": datetime.now(timezone.utc).isoformat(),
-            }
-            result = collection.insert_one(doc)
-            return {"success": True, "sessionId": str(result.inserted_id)}
-        except Exception as e:
-            logger.exception("MongoDB save failed (pymongo): %s", e)
-            raise HTTPException(status_code=500, detail=f"MongoDB save failed: {str(e)}")
+    """Save completed AI mock session via CandidateBackend internal API (no direct DB in Streaming AI)."""
+    import httpx
+
+    cand_url = (getattr(config, "CANDIDATE_BACKEND_URL", "") or "").rstrip("/")
+    if not cand_url:
+        raise HTTPException(status_code=503, detail="CANDIDATE_BACKEND_URL not configured")
+
+    token = (
+        getattr(config, "INTERNAL_SERVICE_TOKEN", "")
+        or getattr(config, "ADMIN_SERVICE_TOKEN", "")
+        or ""
+    ).strip()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Service-Token"] = token
+
+    payload = {
+        "candidateId": request.candidateId,
+        "round": request.round,
+        "roundTitle": request.roundTitle,
+        "mode": request.mode,
+        "durationMinutes": request.durationMinutes,
+        "concepts": request.concepts,
+        "questions": [q.dict() if hasattr(q, "dict") else q.model_dump() for q in request.questions],
+        "status": request.status,
+        "startedAt": request.startedAt or datetime.now(timezone.utc).isoformat(),
+        "completedAt": request.completedAt or datetime.now(timezone.utc).isoformat(),
+    }
 
     try:
-        client = AsyncIOMotorClient(config.MONGODB_URL)
-        db = client[config.MONGODB_DB_NAME]
-        collection = db["aimock"]
-        doc = {
-            "candidateId": request.candidateId,
-            "round": request.round,
-            "roundTitle": request.roundTitle,
-            "mode": request.mode,
-            "durationMinutes": request.durationMinutes,
-            "concepts": request.concepts,
-            "questions": [q.dict() if hasattr(q, "dict") else q.model_dump() for q in request.questions],
-            "status": request.status,
-            "startedAt": request.startedAt or datetime.now(timezone.utc).isoformat(),
-            "completedAt": request.completedAt or datetime.now(timezone.utc).isoformat(),
-            "savedAt": datetime.now(timezone.utc).isoformat(),
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{cand_url}/internal/streaming/ai-mock/save-session",
+                headers=headers,
+                json=payload,
+            )
+
+        if resp.status_code >= 300:
+            detail = resp.text[:400]
+            logger.error("CandidateBackend save-session failed: %s %s", resp.status_code, detail)
+            raise HTTPException(status_code=502, detail=f"CandidateBackend save-session failed: {detail}")
+
+        data = resp.json() if resp.content else {}
+        return {
+            "success": bool(data.get("success", True)),
+            "sessionId": data.get("sessionId"),
         }
-        result = await collection.insert_one(doc)
-        return {"success": True, "sessionId": str(result.inserted_id)}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("MongoDB save failed (motor): %s", e)
-        raise HTTPException(status_code=500, detail=f"MongoDB save failed: {str(e)}")
+        logger.exception("CandidateBackend save-session request failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"save-session failed: {str(e)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -127,7 +127,7 @@ def run_assemblyai_stream(
     client.on(StreamingEvents.Error, on_error)
 
     try:
-        client.connect(StreamingParameters(sample_rate=SAMPLE_RATE_TARGET, format_turns=True))
+        client.connect(StreamingParameters(sample_rate=SAMPLE_RATE_TARGET, format_turns=True, speech_model="nano"))
         gen = _audio_generator(audio_queue, done, client_sample_rate)
         client.stream(gen)
     except Exception as e:

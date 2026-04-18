@@ -305,6 +305,8 @@ async def _process_report(item: dict):
 
     # AI analysis
     analysis = await _run_full_analysis(
+        candidate_id=candidate_id,
+        position_id=position_id,
         position_details=position_details,
         jd_text=jd_text,
         resume_text=resume_text,
@@ -649,6 +651,8 @@ def _generate_resume_summary(client, model: str, resume_text: str, pos_title: st
 # Full AI Analysis
 # ──────────────────────────────────────────────────────────────────────────────
 async def _run_full_analysis(
+    candidate_id: str,
+    position_id: str,
     position_details: dict,
     jd_text: str,
     resume_text: str,

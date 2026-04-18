@@ -133,111 +133,85 @@ class GenerateReportRequest(BaseModel):
 @router.post("/generate")
 async def generate_report(req: GenerateReportRequest):
     """
-    Generate assessment report SYNCHRONOUSLY.
-    - Always regenerates and upserts existing MongoDB doc + MySQL rows (no duplicate records).
-    - Returns 200 + completed report on success.
-    - Returns 202 if already generating in this process (concurrent duplicate guard).
-    NOTE: For the "check is_generated then fetch or generate" flow, use
-          GET /admin-report/fetch-or-generate (checks MySQL flag first).
+    Queue report generation ASYNCHRONOUSLY.
+    - If already in progress or queued, returns 202.
+    - Otherwise, adds to asyncio worker queue and returns 202.
     """
+    await _start_worker()
     key = _queue_key(req.positionId, req.candidateId)
 
-    # 1. Prevent duplicate concurrent generation within the same process
-    if key in _in_progress:
-        logger.info("[ReportGen] Report already being generated for %s", key)
+    # 1. Check if already in progress or queued
+    if key in _in_progress or key in _queue_keys:
+        logger.info("[ReportGen] Report generation already in progress for %s", key)
         return JSONResponse(status_code=202, content={
             "success": True,
             "status": "in_progress",
             "message": "Report generation already in progress.",
         })
 
-    # 2. Generate synchronously — always upserts MongoDB doc + MySQL rows, then fetches fresh from DB
-    _in_progress[key] = True
-    try:
-        await _set_generation_state(
-            position_id=req.positionId,
-            candidate_id=req.candidateId,
-            client_id=req.clientId,
-            tenant_id=req.tenantId,
-            status="in_progress",
-        )
+    # 2. Add to queue
+    _queue_keys.add(key)
+    await _report_queue.put({
+        "key": key,
+        "positionId": req.positionId,
+        "candidateId": req.candidateId,
+        "clientId": req.clientId,
+        "tenantId": req.tenantId,
+        "questionSetId": req.questionSetId,
+    })
 
-        logger.info("[ReportGen] Starting synchronous report generation for %s", key)
-
-        await _process_report({
-            "key": key,
-            "positionId": req.positionId,
-            "candidateId": req.candidateId,
-            "clientId": req.clientId,
-            "tenantId": req.tenantId,
-            "questionSetId": req.questionSetId,
-        })
-
-        # Always fetch the saved report from MongoDB — never return from memory
-        logger.info("[ReportGen] Report generation completed for %s — fetching from DB", key)
-        saved = await _get_existing_report(req.positionId, req.candidateId)
-        if saved:
-            return JSONResponse(status_code=200, content=_build_completed_response(saved, is_existing=True))
-
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "status": "error",
-            "message": "Report was saved but could not be retrieved from database.",
-        })
-        
-    except Exception as e:
-        logger.error("[ReportGen] Synchronous generation failed for %s: %s", key, e, exc_info=True)
-        await _set_generation_state(
-            position_id=req.positionId,
-            candidate_id=req.candidateId,
-            client_id=req.clientId,
-            tenant_id=req.tenantId,
-            status="failed",
-            error_message=str(e),
-        )
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "status": "error",
-            "message": f"Report generation failed: {str(e)}",
-        })
-    finally:
-        _in_progress.pop(key, None)
+    logger.info("[ReportGen] Report generation queued for %s", key)
+    return JSONResponse(status_code=202, content={
+        "success": True,
+        "status": "queued",
+        "message": "Report generation has been queued.",
+    })
 
 
 @router.get("/get/{positionId}/{candidateId}")
 async def get_report(positionId: str, candidateId: str, clientId: str = Query(default="")):
     """
     Get the existing generated report from MongoDB.
-    Returns 404 if not generated yet.
+    Returns 202 if in progress, 404 if not found or failed.
     """
     key = _queue_key(positionId, candidateId)
-    in_queue_or_processing = (key in _in_progress or key in _queue_keys)
-
+    
+    # 1. Fetch existing state from MongoDB (via CandidateBackend)
     existing = await _get_existing_report(positionId, candidateId, clientId)
+    
+    # 2. If generated, return it
     if existing and existing.get("isGenerated"):
         enriched = await _inject_dynamic_screenshot_assets(existing, fallback_client_id=clientId)
         return JSONResponse(status_code=200, content=_build_completed_response(enriched, is_existing=True))
 
+    # 3. Check if currently in-progress or queued in this process memory
+    in_memory_busy = (key in _in_progress or key in _queue_keys)
+    
+    # 4. Check persisted status
     persisted_status = (existing or {}).get("generationStatus")
-    if persisted_status in {"queued", "in_progress"}:
+    
+    if in_memory_busy or persisted_status in {"queued", "in_progress"}:
         return JSONResponse(status_code=202, content={
             "success": True,
             "status": "in_progress",
-            "message": "Report generation is in progress.",
+            "message": "Report generation is currently in progress. Please check back in a few moments.",
         })
 
-    if in_queue_or_processing:
-        return JSONResponse(status_code=202, content={
-            "success": True,
-            "status": "in_progress",
-            "message": "Report generation is in progress.",
+    if persisted_status == "failed":
+        return JSONResponse(status_code=404, content={
+            "success": False,
+            "status": "failed",
+            "message": "Report generation failed. Please try manual regeneration.",
+            "error": (existing or {}).get("errorMessage", "Unknown error")
         })
 
+    # 5. Not found at all
     return JSONResponse(status_code=404, content={
         "success": False,
         "status": "not_found",
-        "message": "Report not found in MongoDB for the provided keys.",
+        "message": "Report not found in MongoDB. Ensure test is completed and generation was triggered.",
     })
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1634,9 +1608,16 @@ async def _get_existing_report(position_id: str, candidate_id: str, client_id: s
         if resp.status_code == 200:
             body = resp.json() or {}
             return body.get("data") if isinstance(body, dict) else None
-        if resp.status_code != 404:
-            logger.warning("[ReportGen] CandidateBackend report fetch returned %s", resp.status_code)
+        
+        # Log and potentially expose non-404 errors for debugging
+        msg = f"CandidateBackend fetch returned {resp.status_code}: {resp.text[:200]}"
+        if resp.status_code == 404:
+            logger.info("[ReportGen] %s", msg)
+        else:
+            logger.warning("[ReportGen] %s", msg)
+            
         return None
+
     except Exception as e:
         logger.warning("[ReportGen] CandidateBackend report fetch failed: %s", e)
         return None

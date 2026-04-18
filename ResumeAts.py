@@ -32,6 +32,7 @@ class ScoreByIdsRequest(BaseModel):
     candidateId: str = Field(..., description="Candidate UUID")
     positionCandidateId: str = Field(..., description="Position-candidate link ID")
     tenantId: str = Field(..., description="Tenant DB/schema name (X-Tenant-Id)")
+    resumeText: str = Field(default=None, description="Optional: Frontend-extracted resume text")
 
 
 class ResumeAtsResponse(BaseModel):
@@ -222,9 +223,25 @@ Output your analysis as a JSON object only:
 async def score_resume_by_ids(request: ScoreByIdsRequest = Body(...)):
     """Full resume score: fetch JD and resume text from AdminBackend, then run AI (dynamic config)."""
     try:
-        job_description_text, resume_text, min_exp, max_exp = await _fetch_score_input_from_admin(
-            request.positionId, request.candidateId, request.tenantId
-        )
+        # Step 1: Resolve JD and Resume text
+        job_description_text = ""
+        resume_text = request.resumeText or ""
+        min_exp, max_exp = None, None
+
+        # If resume_text was NOT provided or is too short, fetch everything from AdminBackend
+        if len(resume_text) < 50:
+            job_description_text, backend_resume_text, min_exp, max_exp = await _fetch_score_input_from_admin(
+                request.positionId, request.candidateId, request.tenantId
+            )
+            if len(resume_text) < 50:
+                resume_text = backend_resume_text
+
+        # If JD is still empty (because we used provided resume text but didn't fetch JD), fetch it now
+        if not job_description_text:
+             job_description_text, _, min_exp, max_exp = await _fetch_score_input_from_admin(
+                request.positionId, request.candidateId, request.tenantId
+            )
+
         if len(resume_text) < 50:
             raise HTTPException(
                 status_code=400,

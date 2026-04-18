@@ -23,8 +23,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Thresholds for head movement
-YAW_THRESHOLD = 0.25
-PITCH_THRESHOLD = 0.25
+YAW_THRESHOLD = 0.20
+PITCH_THRESHOLD = 0.20
 
 # Face landmark indices
 NOSE_TIP = 1
@@ -113,8 +113,8 @@ class ProctoringService:
             pitch = (nose.y - vertical_center) / face_height if face_height > 0 else 0
 
             if abs(yaw) > YAW_THRESHOLD or abs(pitch) > PITCH_THRESHOLD:
-                if yaw > YAW_THRESHOLD: event = "looking_right"
-                elif yaw < -YAW_THRESHOLD: event = "looking_left"
+                if yaw > YAW_THRESHOLD: event = "looking_left"
+                elif yaw < -YAW_THRESHOLD: event = "looking_right"
                 elif pitch > PITCH_THRESHOLD: event = "looking_down"
                 elif pitch < -PITCH_THRESHOLD: event = "looking_up"
                 else: event = "head_turned"

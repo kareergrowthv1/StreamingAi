@@ -39,11 +39,13 @@ def _get_openai_client(cfg: dict):
     if not api_key:
         raise ValueError("API key required. Set in Superadmin Settings > AI Config or OPENAI_API_KEY.")
     import openai
+    req_timeout = min(int(cfg.get("timeout", 300)), 20)
+    req_retries = min(int(cfg.get("maxRetries", 3)), 1)
     return openai.OpenAI(
         api_key=api_key,
         base_url=cfg.get("baseUrl", "https://api.openai.com/v1"),
-        timeout=cfg.get("timeout", 300),
-        max_retries=cfg.get("maxRetries", 3),
+        timeout=req_timeout,
+        max_retries=req_retries,
     )
 
 
@@ -106,8 +108,8 @@ The first 8 skills should be mandatory core skills, and the last 4 should be opt
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": prompt},
             ],
-            temperature=1.0,
-            max_tokens=300,
+            temperature=0.4,
+            max_tokens=min(int(cfg.get("maxTokens", 300)), 180),
         )
         text = (response.choices[0].message.content or "").strip()
         return _process_skills_response(text)

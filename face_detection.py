@@ -89,9 +89,11 @@ class ProctoringService:
                 results = landmarker.detect(mp_image)
 
             if not results or not results.face_landmarks:
+                logger.info("Proctoring: No face landmarks detected")
                 return {"event": "no_face", "confidence": 1.0}
 
             if len(results.face_landmarks) > 1:
+                logger.info(f"Proctoring: Multiple faces detected ({len(results.face_landmarks)})")
                 return {"event": "multiple_faces", "confidence": 0.9}
 
             # Pose estimation using landmarks
@@ -112,12 +114,15 @@ class ProctoringService:
             vertical_center = (forehead.y + chin.y) / 2
             pitch = (nose.y - vertical_center) / face_height if face_height > 0 else 0
 
+            logger.debug(f"Proctoring: yaw={yaw:.2f}, pitch={pitch:.2f}")
+
             if abs(yaw) > YAW_THRESHOLD or abs(pitch) > PITCH_THRESHOLD:
                 if yaw > YAW_THRESHOLD: event = "looking_right"
                 elif yaw < -YAW_THRESHOLD: event = "looking_left"
                 elif pitch > PITCH_THRESHOLD: event = "looking_down"
                 elif pitch < -PITCH_THRESHOLD: event = "looking_up"
                 else: event = "head_turned"
+                logger.info(f"Proctoring: Violation detected - {event} (yaw={yaw:.2f}, pitch={pitch:.2f})")
                 return {"event": event, "confidence": 0.9, "yaw": yaw, "pitch": pitch}
 
             return {"event": "ok", "confidence": 1.0}

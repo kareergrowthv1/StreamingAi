@@ -40,8 +40,16 @@ router = APIRouter(prefix="/report", tags=["Report Generator"])
 # ──────────────────────────────────────────────────────────────────────────────
 # CandidateBackend persistence API (Streaming AI does not connect to DB directly)
 # ──────────────────────────────────────────────────────────────────────────────
-def _candidate_backend_url() -> str:
-    return (getattr(config, "CANDIDATE_BACKEND_URL", "") or "").rstrip("/")
+def _candidate_backend_urls() -> List[str]:
+    configured = (getattr(config, "CANDIDATE_BACKEND_URL", "") or "").strip().rstrip("/")
+    fallbacks = [
+        "http://localhost:8003",
+        "http://127.0.0.1:8003",
+        "https://localhost:8443",
+    ]
+    ordered = [u for u in [configured, *fallbacks] if u]
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(ordered))
 
 
 def _candidate_internal_headers() -> dict:
@@ -1514,8 +1522,8 @@ def _build_completed_response(report_doc: dict, is_existing: bool) -> dict:
 
 async def _save_report(position_id: str, candidate_id: str, doc: dict):
     """Upsert report document through CandidateBackend internal API."""
-    base = _candidate_backend_url()
-    if not base:
+    bases = _candidate_backend_urls()
+    if not bases:
         logger.warning("[ReportGen] CANDIDATE_BACKEND_URL not configured — cannot save report")
         return
 
@@ -1523,19 +1531,26 @@ async def _save_report(position_id: str, candidate_id: str, doc: dict):
     payload["positionId"] = position_id
     payload["candidateId"] = candidate_id
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                f"{base}/internal/streaming/report-document",
-                headers=_candidate_internal_headers(),
-                json=payload,
-            )
-        if resp.status_code >= 300:
-            logger.warning("[ReportGen] CandidateBackend report save failed: %s %s", resp.status_code, resp.text[:300])
-        else:
-            logger.info("[ReportGen] Saved report via CandidateBackend for %s/%s", position_id, candidate_id)
-    except Exception as e:
-        logger.error("[ReportGen] CandidateBackend report save error: %s", e)
+    last_error = None
+    for base in bases:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    f"{base}/internal/streaming/report-document",
+                    headers=_candidate_internal_headers(),
+                    json=payload,
+                )
+            if resp.status_code < 300:
+                logger.info("[ReportGen] Saved report via CandidateBackend %s for %s/%s", base, position_id, candidate_id)
+                return
+
+            last_error = f"{base} -> {resp.status_code}: {resp.text[:300]}"
+            logger.warning("[ReportGen] CandidateBackend report save failed: %s", last_error)
+        except Exception as e:
+            last_error = f"{base} -> {e}"
+            logger.warning("[ReportGen] CandidateBackend report save error: %s", last_error)
+
+    logger.error("[ReportGen] All CandidateBackend report save attempts failed: %s", last_error)
 
 
 async def _set_generation_state(
@@ -1550,8 +1565,8 @@ async def _set_generation_state(
     if not position_id or not candidate_id:
         return
 
-    base = _candidate_backend_url()
-    if not base:
+    bases = _candidate_backend_urls()
+    if not bases:
         return
 
     now = datetime.now(timezone.utc).isoformat()
@@ -1574,21 +1589,28 @@ async def _set_generation_state(
         payload["isGenerated"] = False
         payload["generationError"] = (error_message or "")[:1000]
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            await client.patch(
-                f"{base}/internal/streaming/report-document",
-                headers=_candidate_internal_headers(),
-                json=payload,
-            )
-    except Exception as e:
-        logger.warning("[ReportGen] Failed to persist generation status (%s): %s", status, e)
+    last_error = None
+    for base in bases:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.patch(
+                    f"{base}/internal/streaming/report-document",
+                    headers=_candidate_internal_headers(),
+                    json=payload,
+                )
+            if resp.status_code < 300:
+                return
+            last_error = f"{base} -> {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:
+            last_error = f"{base} -> {e}"
+
+    logger.warning("[ReportGen] Failed to persist generation status (%s): %s", status, last_error)
 
 
 async def _get_existing_report(position_id: str, candidate_id: str, client_id: str = "") -> Optional[dict]:
     """Fetch existing report through CandidateBackend internal API."""
-    base = _candidate_backend_url()
-    if not base:
+    bases = _candidate_backend_urls()
+    if not bases:
         return None
 
     params = {
@@ -1598,29 +1620,32 @@ async def _get_existing_report(position_id: str, candidate_id: str, client_id: s
     if client_id:
         params["clientId"] = client_id
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                f"{base}/internal/streaming/report-document",
-                headers=_candidate_internal_headers(),
-                params=params,
-            )
-        if resp.status_code == 200:
-            body = resp.json() or {}
-            return body.get("data") if isinstance(body, dict) else None
-        
-        # Log and potentially expose non-404 errors for debugging
-        msg = f"CandidateBackend fetch returned {resp.status_code}: {resp.text[:200]}"
-        if resp.status_code == 404:
-            logger.info("[ReportGen] %s", msg)
-        else:
-            logger.warning("[ReportGen] %s", msg)
-            
-        return None
+    last_msg = ""
+    for base in bases:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{base}/internal/streaming/report-document",
+                    headers=_candidate_internal_headers(),
+                    params=params,
+                )
+            if resp.status_code == 200:
+                body = resp.json() or {}
+                logger.info("[ReportGen] Existing report fetched via CandidateBackend %s", base)
+                return body.get("data") if isinstance(body, dict) else None
 
-    except Exception as e:
-        logger.warning("[ReportGen] CandidateBackend report fetch failed: %s", e)
-        return None
+            msg = f"{base} -> {resp.status_code}: {resp.text[:200]}"
+            last_msg = msg
+            if resp.status_code == 404:
+                logger.info("[ReportGen] CandidateBackend fetch miss: %s", msg)
+            else:
+                logger.warning("[ReportGen] CandidateBackend fetch issue: %s", msg)
+        except Exception as e:
+            last_msg = f"{base} -> {e}"
+            logger.warning("[ReportGen] CandidateBackend report fetch failed: %s", last_msg)
+
+    logger.info("[ReportGen] Existing report not found in any CandidateBackend source. Last: %s", last_msg)
+    return None
 
 
 async def _mark_report_generated(

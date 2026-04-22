@@ -36,11 +36,13 @@ def _get_openai_client(cfg: dict):
     if not api_key:
         raise ValueError("API key required. Set in Superadmin Settings > AI Config or OPENAI_API_KEY.")
     import openai
+    req_timeout = min(int(cfg.get("timeout", 300)), 25)
+    req_retries = min(int(cfg.get("maxRetries", 3)), 1)
     return openai.OpenAI(
         api_key=api_key,
         base_url=cfg.get("baseUrl", "https://api.openai.com/v1"),
-        timeout=cfg.get("timeout", 300),
-        max_retries=cfg.get("maxRetries", 3),
+        timeout=req_timeout,
+        max_retries=req_retries,
     )
 
 
@@ -157,8 +159,8 @@ Qualified candidates with the required experience and skills are encouraged to a
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.7,
-            max_tokens=1500,
+            temperature=0.5,
+            max_tokens=min(int(cfg.get("maxTokens", 1024)), 900),
         )
         text = (response.choices[0].message.content or "").strip()
         result = _validate_jd(
@@ -259,8 +261,8 @@ Qualified candidates with the required experience and skills are encouraged to a
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.7,
-            max_tokens=1500,
+            temperature=0.5,
+            max_tokens=min(int(cfg.get("maxTokens", 1024)), 900),
             stream=True
         )
 

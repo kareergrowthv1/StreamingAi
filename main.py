@@ -1868,6 +1868,7 @@ async def websocket_test_session(websocket: WebSocket):
                 if not image_b64:
                     await websocket.send_json({"type": "proctoring_result", "event": "ok", "confidence": 0.0})
                     continue
+                # logger.debug(f"[PROCTORING] Frame received for processing")
                 try:
                     result = await asyncio.to_thread(face_detection_analyze, image_b64)
                     event = result.get("event", "ok")

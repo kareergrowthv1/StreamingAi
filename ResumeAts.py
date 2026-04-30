@@ -24,6 +24,7 @@ class ResumeAtsRequest(BaseModel):
     """Request body: resume and job description text (for direct calculate-score)."""
     resumeText: str = Field(..., description="Full resume text")
     jobDescriptionText: str = Field(..., description="Full job description or position requirements text")
+    scoringWeights: dict = Field(default_factory=dict, description="Optional dynamic weights from admin settings")
 
 
 class ScoreByIdsRequest(BaseModel):
@@ -33,6 +34,7 @@ class ScoreByIdsRequest(BaseModel):
     positionCandidateId: str = Field(..., description="Position-candidate link ID")
     tenantId: str = Field(..., description="Tenant DB/schema name (X-Tenant-Id)")
     resumeText: str = Field(default=None, description="Optional: Frontend-extracted resume text")
+    scoringWeights: dict = Field(default_factory=dict, description="Optional dynamic weights from admin settings")
 
 
 class ResumeAtsResponse(BaseModel):
@@ -110,6 +112,50 @@ def _process_match_response(response: str) -> dict:
     except Exception as e:
         logger.error("Resume ATS process error: %s", e)
         raise HTTPException(status_code=502, detail=str(e))
+
+
+def _normalize_weight(value, default_value):
+    try:
+        n = float(value)
+        return n if n >= 0 else float(default_value)
+    except Exception:
+        return float(default_value)
+
+
+def _compute_weighted_overall(category_scores: dict, scoring_weights: dict | None) -> float:
+    defaults = {
+        "skills": 30,
+        "experience": 25,
+        "education": 20,
+        "certifications": 15,
+        "projects": 10,
+    }
+    weights = scoring_weights if isinstance(scoring_weights, dict) else {}
+    normalized_weights = {
+        "skills": _normalize_weight(weights.get("skills"), defaults["skills"]),
+        "experience": _normalize_weight(weights.get("experience"), defaults["experience"]),
+        "education": _normalize_weight(weights.get("education"), defaults["education"]),
+        "certifications": _normalize_weight(weights.get("certifications"), defaults["certifications"]),
+        "projects": _normalize_weight(weights.get("projects"), defaults["projects"]),
+    }
+    total_weight = sum(normalized_weights.values()) or 100.0
+
+    score_map = {
+        "skills": float(category_scores.get("technicalSkills") or 0.0),
+        "experience": float(category_scores.get("experience") or 0.0),
+        "education": float(category_scores.get("education") or 0.0),
+        "certifications": float(category_scores.get("industryKnowledge") or 0.0),
+        "projects": float(category_scores.get("roleSpecific") or 0.0),
+    }
+
+    overall = (
+        score_map["skills"] * normalized_weights["skills"]
+        + score_map["experience"] * normalized_weights["experience"]
+        + score_map["education"] * normalized_weights["education"]
+        + score_map["certifications"] * normalized_weights["certifications"]
+        + score_map["projects"] * normalized_weights["projects"]
+    ) / total_weight
+    return max(0.0, min(100.0, round(overall, 1)))
 
 
 async def _fetch_score_input_from_admin(position_id: str, candidate_id: str, tenant_id: str):
@@ -257,6 +303,8 @@ async def score_resume_by_ids(request: ScoreByIdsRequest = Body(...)):
         )
         response_text = await _generate_completion(prompt, system_message, temperature_override=0.1)
         result = _process_match_response(response_text)
+        if request.scoringWeights:
+            result["overallScore"] = _compute_weighted_overall(result.get("categoryScores") or {}, request.scoringWeights)
         return ResumeAtsResponse(**result)
     except HTTPException:
         raise
@@ -280,4 +328,6 @@ async def calculate_resume_match_score(request: ResumeAtsRequest = Body(...)):
     prompt, system_message = _build_prompt_and_system(jd_text, resume_text)
     response_text = await _generate_completion(prompt, system_message, temperature_override=0.1)
     result = _process_match_response(response_text)
+    if request.scoringWeights:
+        result["overallScore"] = _compute_weighted_overall(result.get("categoryScores") or {}, request.scoringWeights)
     return ResumeAtsResponse(**result)

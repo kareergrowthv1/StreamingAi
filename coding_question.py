@@ -4,7 +4,7 @@ Coding question generation and Judge0-based code execution.
 - POST /run-code                  → Execute candidate code against test cases via Judge0 (RapidAPI)
 
 Uses dynamic AI config (Superadmin GET /superadmin/settings/ai-config); no hardcoded OpenAI keys.
-Judge0 key is read from JUDGE0_RAPIDAPI_KEY env var.
+Judge0 config is fetched dynamically from Superadmin settings (/superadmin/settings/judge0).
 """
 import asyncio
 import base64
@@ -28,14 +28,89 @@ router = APIRouter(prefix="/coding", tags=["coding"])
 # Judge0 helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-JUDGE0_BASE_URL = "https://judge0-ce.p.rapidapi.com"
-JUDGE0_RAPIDAPI_HOST = "judge0-ce.p.rapidapi.com"
+JUDGE0_SETTINGS_CACHE_TTL_SEC = 60
+_judge0_settings_cache = {
+    "fetched_at": 0.0,
+    "config": None,
+}
 
-def _judge0_headers() -> dict:
-    key = os.getenv("JUDGE0_RAPIDAPI_KEY", "")
+
+def _first_non_empty_string(values: list) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _parse_judge0_settings_payload(payload: dict) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    enabled = bool(payload.get("enabled", True))
+    api_key = _first_non_empty_string([payload.get("apiKey"), payload.get("rapidApiKey")])
+    base_url = str(payload.get("baseUrl", "")).strip().rstrip("/")
+    api_host = str(payload.get("apiHost", "")).strip()
+    if not api_host and base_url:
+        try:
+            api_host = str(httpx.URL(base_url).host or "")
+        except Exception:
+            api_host = ""
+    if not enabled or not api_key or not base_url or not api_host:
+        return None
+    return {
+        "apiKey": api_key,
+        "baseUrl": base_url,
+        "apiHost": api_host,
+    }
+
+
+async def _get_judge0_config() -> dict | None:
+    now = time.time()
+    cached = _judge0_settings_cache.get("config")
+    fetched_at = _judge0_settings_cache.get("fetched_at", 0.0)
+    if cached and (now - fetched_at) < JUDGE0_SETTINGS_CACHE_TTL_SEC:
+        return cached
+
+    superadmin_url = str(getattr(config, "SUPERADMIN_BACKEND_URL", "")).strip().rstrip("/")
+    service_token = _first_non_empty_string([
+        getattr(config, "SUPERADMIN_SERVICE_TOKEN", ""),
+        getattr(config, "INTERNAL_SERVICE_TOKEN", ""),
+    ])
+    if not superadmin_url or not service_token:
+        logger.warning("[coding_question] Superadmin URL/service token missing; cannot fetch Judge0 settings dynamically.")
+        return None
+
+    url = f"{superadmin_url}/superadmin/settings/judge0"
+    headers = {
+        "X-Service-Token": service_token,
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.warning("[coding_question] Judge0 settings fetch failed: %s %s", resp.status_code, resp.text[:200])
+            return None
+        body = {}
+        content_type = str(resp.headers.get("content-type", "")).lower()
+        if content_type.startswith("application/json"):
+            body = resp.json()
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        cfg = _parse_judge0_settings_payload(data)
+        if not cfg:
+            logger.warning("[coding_question] Judge0 settings are empty/incomplete in Superadmin.")
+            return None
+        _judge0_settings_cache["fetched_at"] = now
+        _judge0_settings_cache["config"] = cfg
+        return cfg
+    except Exception as exc:
+        logger.warning("[coding_question] Judge0 settings fetch exception: %s", exc)
+        return None
+
+def _judge0_headers(judge0_config: dict) -> dict:
+    key = judge0_config.get("apiKey", "")
     return {
         "Content-Type": "application/json",
-        "x-rapidapi-host": JUDGE0_RAPIDAPI_HOST,
+        "x-rapidapi-host": judge0_config.get("apiHost", ""),
         "x-rapidapi-key": key,
     }
 
@@ -89,6 +164,7 @@ def _outputs_match(actual: str, expected: str) -> bool:
 
 async def _run_code_get_output(
     client: httpx.AsyncClient,
+    judge0_config: dict,
     source_code: str,
     language_id: int,
     stdin: str,
@@ -107,19 +183,19 @@ async def _run_code_get_output(
             "source_code": encoded_code,
             "stdin": encoded_stdin,
         }
-        sub_url = f"{JUDGE0_BASE_URL}/submissions?base64_encoded=true&wait=false&fields=*"
-        resp = await client.post(sub_url, json=payload, headers=_judge0_headers(), timeout=15)
+        sub_url = f"{judge0_config['baseUrl']}/submissions?base64_encoded=true&wait=false&fields=*"
+        resp = await client.post(sub_url, json=payload, headers=_judge0_headers(judge0_config), timeout=15)
         if resp.status_code != 201:
             return None
         token = resp.json().get("token")
         if not token:
             return None
 
-        poll_url = f"{JUDGE0_BASE_URL}/submissions/{token}?base64_encoded=true&fields=stdout,stderr,status,exit_code"
+        poll_url = f"{judge0_config['baseUrl']}/submissions/{token}?base64_encoded=true&fields=stdout,stderr,status,exit_code"
         deadline = time.time() + timeout
         while time.time() < deadline:
             await asyncio.sleep(1.0)
-            pr = await client.get(poll_url, headers=_judge0_headers(), timeout=10)
+            pr = await client.get(poll_url, headers=_judge0_headers(judge0_config), timeout=10)
             data = pr.json()
             status_id = data.get("status", {}).get("id", 0)
             if status_id in (1, 2):  # In Queue / Processing
@@ -138,6 +214,7 @@ async def _run_code_get_output(
 
 
 async def _compute_outputs_via_judge0(
+    judge0_config: dict,
     reference_solution: str,
     language_id: int,
     test_cases: list,
@@ -147,12 +224,9 @@ async def _compute_outputs_via_judge0(
     Replaces each test case's 'output' with the real computed stdout.
     Test cases where execution fails keep their original AI-generated output.
     """
-    if not os.getenv("JUDGE0_RAPIDAPI_KEY", ""):
-        return test_cases  # Judge0 not configured — skip verification
-
     async with httpx.AsyncClient() as client:
         tasks = [
-            _run_code_get_output(client, reference_solution, language_id, tc.get("input", ""))
+            _run_code_get_output(client, judge0_config, reference_solution, language_id, tc.get("input", ""))
             for tc in test_cases
         ]
         results = await asyncio.gather(*tasks)
@@ -173,6 +247,7 @@ async def _compute_outputs_via_judge0(
 
 async def _run_single_test_case(
     client: httpx.AsyncClient,
+    judge0_config: dict,
     source_code: str,
     language_id: int,
     stdin: str,
@@ -191,8 +266,8 @@ async def _run_single_test_case(
             "stdin": encoded_stdin,
         }
 
-        sub_url = f"{JUDGE0_BASE_URL}/submissions?base64_encoded=true&wait=false&fields=*"
-        resp = await client.post(sub_url, json=payload, headers=_judge0_headers(), timeout=15)
+        sub_url = f"{judge0_config['baseUrl']}/submissions?base64_encoded=true&wait=false&fields=*"
+        resp = await client.post(sub_url, json=payload, headers=_judge0_headers(judge0_config), timeout=15)
         if resp.status_code != 201:
             raise Exception(f"Judge0 submission failed: {resp.text}")
 
@@ -201,12 +276,12 @@ async def _run_single_test_case(
             raise Exception("No token returned by Judge0")
 
         # Poll for result
-        result_url = f"{JUDGE0_BASE_URL}/submissions/{token}?base64_encoded=true&fields=*"
+        result_url = f"{judge0_config['baseUrl']}/submissions/{token}?base64_encoded=true&fields=*"
         waited = 0
         while waited < timeout:
             await asyncio.sleep(1)
             waited += 1
-            r = await client.get(result_url, headers=_judge0_headers(), timeout=10)
+            r = await client.get(result_url, headers=_judge0_headers(judge0_config), timeout=10)
             if r.status_code != 200:
                 raise Exception(f"Judge0 result fetch failed: {r.text}")
             data = r.json()
@@ -417,14 +492,18 @@ async def generate_coding_question(req: GenerateQuestionRequest):
         reference_solution = data.get("referenceSolution", "").strip()
         if reference_solution and data["testCases"]:
             lang_id = get_language_id(req.programmingLanguage)
-            logger.info(
-                "[coding_question] Verifying %d test case(s) via Judge0 (lang_id=%d)…",
-                len(data["testCases"]), lang_id,
-            )
-            data["testCases"] = await _compute_outputs_via_judge0(
-                reference_solution, lang_id, data["testCases"]
-            )
-            logger.info("[coding_question] Test case verification complete.")
+            judge0_config = await _get_judge0_config()
+            if not judge0_config:
+                logger.warning("[coding_question] Judge0 config missing; skipping test case verification.")
+            else:
+                logger.info(
+                    "[coding_question] Verifying %d test case(s) via Judge0 (lang_id=%d)…",
+                    len(data["testCases"]), lang_id,
+                )
+                data["testCases"] = await _compute_outputs_via_judge0(
+                    judge0_config, reference_solution, lang_id, data["testCases"]
+                )
+                logger.info("[coding_question] Test case verification complete.")
 
         # Strip referenceSolution from the response sent to the client
         # (it's a backend-only tool; no need to expose the answer to candidates)
@@ -451,9 +530,9 @@ async def run_code(req: RunCodeRequest):
     if not req.testCases:
         raise HTTPException(status_code=400, detail="At least one test case is required.")
 
-    judge0_key = os.getenv("JUDGE0_RAPIDAPI_KEY", "")
-    if not judge0_key:
-        raise HTTPException(status_code=503, detail="Judge0 API key not configured. Set JUDGE0_RAPIDAPI_KEY in environment.")
+    judge0_config = await _get_judge0_config()
+    if not judge0_config:
+        raise HTTPException(status_code=503, detail="Judge0 settings are missing/incomplete in Superadmin. Configure apiKey/baseUrl/apiHost.")
 
     language_id = get_language_id(req.language)
     results = []
@@ -462,6 +541,7 @@ async def run_code(req: RunCodeRequest):
         tasks = [
             _run_single_test_case(
                 client=client,
+                    judge0_config=judge0_config,
                 source_code=req.sourceCode,
                 language_id=language_id,
                 stdin=tc.input,

@@ -472,15 +472,68 @@ def _calc_round_marks(position_details: dict, assessment_summary: dict) -> dict:
 
 
 def _score_aptitude(r4_answers: list) -> dict:
-    """Score aptitude by comparing answer_text vs correct_answer."""
-    total = len([q for q in r4_answers if q.get("correctAnswer")])
+    """Score aptitude by comparing candidate answer and correct answer robustly (key/text aware)."""
+    total = len([q for q in r4_answers if str(q.get("correctAnswer") or "").strip()])
     if total == 0:
         return {"correct": 0, "total": 0, "percentage": 0.0}
     correct = sum(
-        1 for q in r4_answers
-        if q.get("correctAnswer") and (q.get("answerText") or "").strip() == str(q.get("correctAnswer") or "").strip()
+        1 for q in r4_answers if _is_aptitude_correct(q)
     )
     return {"correct": correct, "total": total, "percentage": round((correct / total) * 100, 1)}
+
+
+def _normalize_option_rows(options: Any) -> list:
+    rows = []
+    if isinstance(options, list):
+        for idx, opt in enumerate(options):
+            if isinstance(opt, dict):
+                key = str(opt.get("optionKey") or opt.get("option") or chr(65 + idx)).strip().upper()
+                text = str(opt.get("text") or opt.get("optionText") or "").strip()
+            else:
+                key = chr(65 + idx)
+                text = str(opt or "").strip()
+            rows.append({"key": key, "text": text})
+    elif isinstance(options, dict):
+        for key, text in options.items():
+            rows.append({"key": str(key or "").strip().upper(), "text": str(text or "").strip()})
+    return rows
+
+
+def _resolve_candidate_answer(q: dict) -> tuple[str, str]:
+    options = _normalize_option_rows(q.get("options"))
+    key_to_text = {row["key"]: row["text"] for row in options if row.get("key")}
+
+    candidate_key = str(q.get("selectedOptionKey") or "").strip().upper()
+    candidate_text = str(q.get("selectedOptionText") or q.get("answerText") or q.get("answer") or "").strip()
+
+    if candidate_key and not candidate_text:
+        candidate_text = key_to_text.get(candidate_key, "")
+
+    if (not candidate_key) and candidate_text:
+        prefix = re.match(r"^([A-D])\s*[\).:\-]", candidate_text, flags=re.IGNORECASE)
+        if prefix:
+            candidate_key = prefix.group(1).upper()
+        else:
+            for row in options:
+                if row.get("text") and row["text"].strip().lower() == candidate_text.lower():
+                    candidate_key = row.get("key", "")
+                    break
+
+    if candidate_key and not candidate_text:
+        candidate_text = key_to_text.get(candidate_key, "")
+
+    return candidate_key, candidate_text
+
+
+def _is_aptitude_correct(q: dict) -> bool:
+    correct_raw = str(q.get("correctAnswer") or "").strip()
+    if not correct_raw:
+        return False
+    candidate_key, candidate_text = _resolve_candidate_answer(q)
+    correct_key = correct_raw.upper()
+    if candidate_key and candidate_key == correct_key:
+        return True
+    return bool(candidate_text) and candidate_text.lower() == correct_raw.lower()
 
 
 def _score_coding(r3_data: dict) -> dict:
@@ -927,14 +980,17 @@ async def _run_full_analysis(
     aptitude_score_data = _score_aptitude(r4_data)
     aptitude_analysis = {"questions": [], "score": aptitude_score_data["percentage"]}
     for qa in r4_data:
-        cand_ans = str(qa.get("answerText") or qa.get("answer") or "").strip()
+        cand_key, cand_text = _resolve_candidate_answer(qa)
+        cand_ans = cand_key or cand_text
         correct_ans = str(qa.get("correctAnswer") or "").strip()
-        is_correct = bool(correct_ans) and (cand_ans == correct_ans)
+        is_correct = _is_aptitude_correct(qa)
         aptitude_analysis["questions"].append({
             "questionId": qa.get("questionId") or "",
             "question": qa.get("question") or qa.get("questionText") or qa.get("text") or "",
             "options": qa.get("options") or [],
             "candidateAnswer": cand_ans,
+            "candidateAnswerKey": cand_key,
+            "candidateAnswerText": cand_text,
             "correctAnswer": correct_ans,
             "isCorrect": is_correct,
             "explanation": ("Correct" if is_correct else (
@@ -1221,12 +1277,15 @@ def _build_report_doc(
 
     aptitude_questions = []
     for q in (r4_data or []):
+        cand_key, cand_text = _resolve_candidate_answer(q)
         aptitude_questions.append({
             "question": q.get("question") or q.get("questionText") or q.get("text") or "",
             "options": q.get("options") or [],
-            "candidateAnswer": q.get("answerText") or q.get("answer") or "",
+            "candidateAnswer": cand_key or cand_text,
+            "candidateAnswerKey": cand_key,
+            "candidateAnswerText": cand_text,
             "correctAnswer": q.get("correctAnswer") or "",
-            "isCorrect": bool(q.get("correctAnswer")) and (str(q.get("answerText") or q.get("answer") or "").strip() == str(q.get("correctAnswer") or "").strip()),
+            "isCorrect": _is_aptitude_correct(q),
         })
 
     screenshot_assets = screenshot_assets or {}

@@ -970,8 +970,9 @@ async def _fetch_aptitude_data(
         candidate_id, position_id, question_set_id or "(none)", client_id or "(none)",
     )
 
-    # ── Step 1: Fetch full question objects from MongoDB ─────────────────────
+    # ── Step 1: Fetch full question objects + selected answers from MongoDB ──
     mongo_questions: list = []
+    selected_answers: list = []
     try:
         if question_set_id:
             r = await client.get(
@@ -983,7 +984,10 @@ async def _fetch_aptitude_data(
                 r.status_code,
             )
             if r.status_code == 200:
-                mongo_questions = r.json().get("questions") or []
+                parsed = r.json()
+                body = parsed if isinstance(parsed, dict) else {}
+                mongo_questions = body.get("questions") or []
+                selected_answers = (body.get("record") or {}).get("selectedAnswers") or []
                 logger.info("[AdminReportAPI][Aptitude] MongoDB questions (by qset): %d", len(mongo_questions))
             else:
                 logger.warning(
@@ -1003,7 +1007,10 @@ async def _fetch_aptitude_data(
                 r2.status_code,
             )
             if r2.status_code == 200:
-                mongo_questions = r2.json().get("generatedQuestions") or []
+                parsed = r2.json()
+                body = parsed if isinstance(parsed, dict) else {}
+                mongo_questions = body.get("generatedQuestions") or []
+                selected_answers = body.get("selectedAnswers") or []
                 logger.info("[AdminReportAPI][Aptitude] MongoDB fallback questions: %d", len(mongo_questions))
             else:
                 logger.warning(
@@ -1013,59 +1020,55 @@ async def _fetch_aptitude_data(
     except Exception as e:
         logger.warning("[AdminReportAPI][Aptitude] MongoDB fetch exception: %s", e)
 
-    # ── Step 2: Fetch candidate answers from MySQL ───────────────────────────
-    mysql_answers: Dict[str, Dict] = {}
-    try:
-        params: Dict[str, str] = {
-            "clientId": client_id or candidate_id,
-            "candidateId": candidate_id,
-            "positionId": position_id,
-            "round": "4",
+    # ── Step 2: Build answer map from selectedAnswers stored in Mongo ────────
+    answer_map: Dict[str, Dict] = {}
+    for row in selected_answers or []:
+        qid = str(row.get("questionId") or "")
+        if not qid:
+            continue
+        answer_map[qid] = {
+            "answerText": row.get("selectedOptionText") or row.get("answerText") or "",
+            "selectedOptionKey": row.get("selectedOptionKey") or "",
+            "selectedOptionText": row.get("selectedOptionText") or row.get("answerText") or "",
         }
-        if question_set_id:
-            params["questionSetId"] = question_set_id
-        logger.info("[AdminReportAPI][Aptitude] MySQL fetch params: %s", params)
-        r3 = await client.get(f"{cand_url}/public/question-answers", params=params)
-        logger.info("[AdminReportAPI][Aptitude] MySQL /question-answers status=%d", r3.status_code)
-        if r3.status_code == 200:
-            rows = r3.json().get("data") or []
-            for row in rows:
-                qid = str(row.get("questionId") or "")
-                if qid:
-                    mysql_answers[qid] = {
-                        "answerText": row.get("answerText") or "",
-                        "correctAnswer": row.get("correctAnswer") or "",
-                    }
-            logger.info("[AdminReportAPI][Aptitude] MySQL answers fetched: %d rows, %d unique questionIds", len(rows), len(mysql_answers))
-        else:
-            logger.warning("[AdminReportAPI][Aptitude] MySQL %d: %s", r3.status_code, r3.text[:300])
-    except Exception as e:
-        logger.warning("[AdminReportAPI][Aptitude] MySQL fetch exception: %s", e)
+    logger.info(
+        "[AdminReportAPI][Aptitude] Mongo selectedAnswers fetched: %d rows, %d unique questionIds",
+        len(selected_answers or []),
+        len(answer_map),
+    )
 
     # ── Step 3: Merge question objects with candidate answers ────────────────
     if mongo_questions:
         merged = []
         for q in mongo_questions:
             qid = str(q.get("id") or "")
-            ans_row = mysql_answers.get(qid) or {}
+            ans_row = answer_map.get(qid) or {}
             merged.append({
                 **q,
                 "questionId": qid,
                 "answerText": ans_row.get("answerText") or q.get("answerText") or "",
-                "correctAnswer": ans_row.get("correctAnswer") or q.get("correctAnswer") or "",
+                "selectedOptionKey": ans_row.get("selectedOptionKey") or "",
+                "selectedOptionText": ans_row.get("selectedOptionText") or "",
+                "correctAnswer": q.get("correctAnswer") or "",
             })
         logger.info("[AdminReportAPI][Aptitude] MERGED result: %d questions (%d with answers)", len(merged), sum(1 for m in merged if m.get("answerText")))
         return merged
 
-    # Fallback: if no MongoDB questions, return MySQL rows only (no question text)
-    if mysql_answers:
-        logger.info("[AdminReportAPI][Aptitude] MongoDB empty — returning %d MySQL-only rows (no question text)", len(mysql_answers))
+    # Fallback: if no Mongo questions, return selected answers only
+    if answer_map:
+        logger.info("[AdminReportAPI][Aptitude] Mongo questions empty — returning %d selected-answer rows", len(answer_map))
         return [
-            {"questionId": qid, "answerText": v["answerText"], "correctAnswer": v["correctAnswer"]}
-            for qid, v in mysql_answers.items()
+            {
+                "questionId": qid,
+                "answerText": v["answerText"],
+                "selectedOptionKey": v.get("selectedOptionKey") or "",
+                "selectedOptionText": v.get("selectedOptionText") or "",
+                "correctAnswer": "",
+            }
+            for qid, v in answer_map.items()
         ]
 
-    logger.warning("[AdminReportAPI][Aptitude] BOTH MongoDB and MySQL returned no aptitude data — r4_data will be []")
+    logger.warning("[AdminReportAPI][Aptitude] MongoDB returned no aptitude question/answer data — r4_data will be []")
     return []
 
 

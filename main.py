@@ -13,7 +13,9 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 import websockets
@@ -188,6 +190,7 @@ class ScheduleInterviewRequest(BaseModel):
     organizationId: Optional[str] = None
     positionName: str
     verificationCode: Optional[str] = None
+    googleMeet: Optional[Dict[str, Any]] = None
 
 
 class RunCodeRequest(BaseModel):
@@ -2592,14 +2595,173 @@ def readiness_check():
     return {"ready": True}
 
 
+async def _exchange_google_access_token(client_id: str, client_secret: str, refresh_token: str) -> Dict[str, str]:
+    token_url = "https://oauth2.googleapis.com/token"
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(token_url, data=payload)
+        if response.status_code >= 400:
+            err_text = response.text
+            if "invalid_grant" in err_text:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Google refresh token is invalid or expired. Please reconnect Google from Superadmin settings.",
+                )
+            raise HTTPException(status_code=500, detail=f"Failed to get Google access token: {err_text}")
+        data = response.json()
+        token = str(data.get("access_token") or "").strip()
+        if not token:
+            raise HTTPException(status_code=500, detail="Google access token missing in token response")
+        refreshed_token = str(data.get("refresh_token") or "").strip()
+        return {
+            "accessToken": token,
+            "refreshToken": refreshed_token,
+        }
+
+
+def _extract_google_meet_link(event_payload: Dict[str, Any]) -> str:
+    direct = str(event_payload.get("hangoutLink") or "").strip()
+    if direct:
+        return direct
+
+    conference = event_payload.get("conferenceData") or {}
+    for entry in conference.get("entryPoints") or []:
+        if str(entry.get("entryPointType") or "").lower() == "video":
+            link = str(entry.get("uri") or "").strip()
+            if link:
+                return link
+
+    return ""
+
+
+async def _create_google_meet_event(
+    *,
+    access_token: str,
+    calendar_id: str,
+    summary: str,
+    description: str,
+    start_iso: str,
+    end_iso: str,
+    attendee_emails: List[str],
+) -> Dict[str, Any]:
+    encoded_calendar_id = quote(calendar_id or "primary", safe="")
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{encoded_calendar_id}/events"
+
+    attendees = [
+        {"email": email}
+        for email in attendee_emails
+        if isinstance(email, str) and email.strip()
+    ]
+
+    event_payload: Dict[str, Any] = {
+        "summary": summary,
+        "description": description,
+        "start": {"dateTime": start_iso},
+        "end": {"dateTime": end_iso},
+        "attendees": attendees,
+        "conferenceData": {
+            "createRequest": {
+                "requestId": str(uuid4()),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    params = {
+        "conferenceDataVersion": "1",
+        # Disable Google Calendar invitation emails; AdminBackend sends Zepto invites.
+        "sendUpdates": "none",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.post(url, headers=headers, params=params, json=event_payload)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=500, detail=f"Failed to create Google Meet event: {response.text}")
+        return response.json()
+
+
 @app.post("/schedule-interview")
 async def schedule_interview(body: ScheduleInterviewRequest):
     """Schedule interview (private link). Same API as Streaming. Called by AdminBackend (proxy from AdminFrontend)."""
     request_id = f"{body.positionId}_{body.candidateId}"
+
+    google_meet = body.googleMeet or {}
+    gm_enabled = bool(google_meet.get("enabled"))
+    interview_platform = str(body.interviewPlatform or "").upper()
+
+    if interview_platform == "GOOGLE_MEET" and gm_enabled:
+        client_id = str(google_meet.get("clientId") or "").strip()
+        client_secret = str(google_meet.get("clientSecret") or "").strip()
+        refresh_token = str(google_meet.get("refreshToken") or os.getenv("GOOGLE_MEET_REFRESH_TOKEN") or "").strip()
+        calendar_id = str(google_meet.get("calendarId") or "primary").strip() or "primary"
+        owners = [
+            str(email or "").strip().lower()
+            for email in (google_meet.get("owners") or [])
+            if str(email or "").strip()
+        ]
+
+        if not client_id or not client_secret or not refresh_token:
+            raise HTTPException(
+                status_code=500,
+                detail="Google Meet credentials are incomplete (clientId/clientSecret/refreshToken required)",
+            )
+
+        attendee_emails = []
+        if body.email:
+            attendee_emails.append(str(body.email).strip().lower())
+        attendee_emails.extend(owners)
+        attendee_emails = list(dict.fromkeys([email for email in attendee_emails if email]))
+
+        token_data = await _exchange_google_access_token(client_id, client_secret, refresh_token)
+        access_token = str(token_data.get("accessToken") or "").strip()
+        rotated_refresh_token = str(token_data.get("refreshToken") or "").strip()
+        summary = f"Interview - {body.positionName}"
+        description = (
+            f"Interview scheduled for {body.candidateName}"
+            f"\nPosition: {body.positionName}"
+            f"\nCompany: {body.companyName}"
+        )
+
+        event = await _create_google_meet_event(
+            access_token=access_token,
+            calendar_id=calendar_id,
+            summary=summary,
+            description=description,
+            start_iso=body.linkActiveAt,
+            end_iso=body.linkExpiresAt,
+            attendee_emails=attendee_emails,
+        )
+        meeting_link = _extract_google_meet_link(event)
+        if not meeting_link:
+            raise HTTPException(status_code=500, detail="Google Meet link was not returned by Google Calendar API")
+
+        return {
+            "success": True,
+            "message": "Interview scheduled successfully",
+            "data": {
+                "requestId": request_id,
+                "status": "scheduled",
+                "meetingLink": meeting_link,
+                "calendarEventId": event.get("id"),
+                "calendarHtmlLink": event.get("htmlLink"),
+                "rotatedRefreshToken": rotated_refresh_token,
+            },
+        }
+
     return {
         "success": True,
         "message": "Interview scheduling request received successfully",
-        "data": {"requestId": request_id, "status": "processing"},
+        "data": {"requestId": request_id, "status": "processing", "meetingLink": ""},
     }
 
 

@@ -43,6 +43,33 @@ def _normalize_dynamic_config(cfg: dict) -> dict:
     }
 
 
+def _env_fallback_config() -> dict | None:
+    provider = str(os.getenv("OPENAI_PROVIDER") or "OPENAI").strip().upper()
+    api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    base_url = str(os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip()
+    model = str(os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+
+    if not api_key:
+        return None
+
+    return {
+        "provider": provider,
+        "apiKey": api_key,
+        "baseUrl": base_url,
+        "model": model,
+        "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.7")),
+        "maxTokens": int(os.getenv("OPENAI_MAX_TOKENS", "1024")),
+        "topP": float(os.getenv("OPENAI_TOP_P", "1.0")),
+        "frequencyPenalty": float(os.getenv("OPENAI_FREQUENCY_PENALTY", "0")),
+        "presencePenalty": float(os.getenv("OPENAI_PRESENCE_PENALTY", "0")),
+        "stream": str(os.getenv("OPENAI_STREAM", "true")).lower() == "true",
+        "timeout": int(os.getenv("OPENAI_TIMEOUT", "300")),
+        "chunkSize": int(os.getenv("OPENAI_CHUNK_SIZE", "1024")),
+        "retryOnTimeout": str(os.getenv("OPENAI_RETRY_ON_TIMEOUT", "true")).lower() == "true",
+        "maxRetries": int(os.getenv("OPENAI_MAX_RETRIES", "3")),
+    }
+
+
 async def get_ai_config(tenant_id: str = "") -> dict:
     """
     Fetch AI config from Superadmin backend. Caches per tenant for _CACHE_TTL seconds.
@@ -95,6 +122,14 @@ async def get_ai_config(tenant_id: str = "") -> dict:
     # If fetch failed but we have a previously cached config, keep using it to avoid outages/timeouts.
     if cache_key in _CACHE:
         return _CACHE[cache_key]
+
+    # Final fallback for local/dev resilience when dynamic config API is temporarily unavailable.
+    fallback = _env_fallback_config()
+    if fallback:
+        logger.warning("get_ai_config: using env fallback config (dynamic API unavailable)")
+        _CACHE[cache_key] = fallback
+        _CACHE_TS[cache_key] = now
+        return fallback
 
     raise RuntimeError("Dynamic AI config unavailable and no cached configuration present")
 

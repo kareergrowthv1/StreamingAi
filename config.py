@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 
 base_dir = Path(__file__).resolve().parent
 
+# Snapshot runtime environment before reading project .env files.
+initial_runtime_env = dict(os.environ)
+
 # Always load base env first.
 load_dotenv(dotenv_path=base_dir / ".env")
 
@@ -15,6 +18,23 @@ is_hosted_runtime = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL")
 is_production = str(os.getenv("NODE_ENV", "")).lower() == "production"
 if not is_hosted_runtime and not is_production:
     load_dotenv(dotenv_path=base_dir / ".env.local", override=True)
+
+    # Keep explicit launch-time env vars (from start_terminals.sh/shell) as source of truth.
+    runtime_priority_keys = [
+        "HOST",
+        "PORT",
+        "SSL_KEY_PATH",
+        "SSL_CERT_PATH",
+        "CORS_ORIGINS",
+        "SUPERADMIN_BACKEND_URL",
+        "ADMIN_BACKEND_URL",
+        "CANDIDATE_BACKEND_URL",
+        "NODE_EXTRA_CA_CERTS",
+        "EXTRA_CA_CERT_PATHS",
+    ]
+    for key in runtime_priority_keys:
+        if key in initial_runtime_env and initial_runtime_env[key] is not None:
+            os.environ[key] = initial_runtime_env[key]
 
 
 def _build_ca_bundle_path() -> str:

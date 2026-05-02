@@ -42,6 +42,7 @@ class InterviewQuestionRequest(BaseModel):
         ),
     )
     count: int = Field(5, ge=1, le=20, description="Number of questions to generate (1-20)")
+    previousQuestions: List[str] = Field(default_factory=list, description="List of previously generated questions to avoid repetition")
 
 
 class GeneratedQuestion(BaseModel):
@@ -97,12 +98,17 @@ CRITICAL RULES — follow these exactly:
 4. Questions must be relevant to the position, skills, and experience level provided.
 5. Return ONLY valid JSON — an array of objects, each with the key "text" (the question string). No markdown, no extra keys."""
 
+    prev_q_text = ""
+    if req.previousQuestions:
+        prev_q_text = "\nCRITICAL: DO NOT repeat any of the following questions that have already been generated:\n- " + "\n- ".join(req.previousQuestions)
+
     if req.section == "general":
         user_prompt = (
             f"Generate {req.count} general HR / behavioural conversational interview questions "
             f"for a {req.position} role requiring {exp_range} of experience.\n\n"
             f"Mandatory Skills context: {man_text}\n"
-            f"Optional Skills context: {opt_text}\n\n"
+            f"Optional Skills context: {opt_text}\n"
+            f"{prev_q_text}\n\n"
             f"Guidelines:\n"
             f"- Mix motivational questions (why this role, career goals), behavioural (STAR-format friendly), "
             f"and soft-skill questions (teamwork, conflict resolution, leadership).\n"
@@ -115,7 +121,8 @@ CRITICAL RULES — follow these exactly:
             f"Generate {req.count} position-specific conversational interview questions "
             f"for a {req.position} role requiring {exp_range} of experience.\n\n"
             f"Mandatory Skills: {man_text}\n"
-            f"Optional Skills: {opt_text}\n\n"
+            f"Optional Skills: {opt_text}\n"
+            f"{prev_q_text}\n\n"
             f"Guidelines:\n"
             f"- Questions must probe the candidate's knowledge and experience with the listed skills.\n"
             f"- Include questions about architectural decisions, problem-solving approach, real-world scenarios, "
